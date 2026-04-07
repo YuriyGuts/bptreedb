@@ -1,0 +1,57 @@
+[project]
+name = "bptreedb"
+version = "0.1.0"
+description = "An educational implementation of a database engine based on B+ Trees"
+readme = "README.md"
+authors = [
+    { name = "Yuriy Guts", email = "yuriy.guts@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.10.6,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint]
+select = [
+    "B",        # flake8-bugbear
+    "C4",       # flake8-comprehensions
+#    "D",        # pydocstyle
+    "E",        # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "INP",      # check missing __init__.py
+    "N",        # pep8-naming
+    "PL",       # pylint
+    "PT",       # flake8-pytest-style
+    "PYI",      # flake8-pyi
+    "SIM",      # flake8-simplify
+    "UP",       # pyupgrade
+    "W",        # pycodestyle warnings
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "D",        # tests: no docstrings required
+    "PLR2004",  # tests: magic numbers are fine
+]
+
+[tool.ty.src]
+exclude = ["tests/"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.9",
+    "ty>=0.0.29",
+]
