@@ -14,14 +14,14 @@ def mock_close():
 
 
 @pytest.fixture
-def db():
-    with DB() as db:
+def db(tmp_path):
+    with DB(tmp_path) as db:
         yield db
 
 
-def test_context_manager(mock_close):
+def test_context_manager(tmp_path, mock_close):
     # GIVEN a DB opened as a context manager
-    with DB() as db:
+    with DB(tmp_path) as db:
         # WHEN working inside the context
         # THEN the return value is a DB instance
         assert db.is_opened
@@ -41,7 +41,7 @@ def test_closed_db_rejects_operations(db):
     with pytest.raises(DBClosedError, match="not opened"):
         db.delete(b"foo")
     with pytest.raises(DBClosedError, match="not opened"):
-        list(db.scan(None, None))
+        db.scan(None, None)
 
 
 def test_get_nonexistent(db):
@@ -57,6 +57,15 @@ def test_put_followed_by_get(db):
     # WHEN reading it
     # THEN it should return its value
     assert db.get(b"foo") == b"bar"
+
+
+def test_put_overwrite(db):
+    # GIVEN a DB with one key
+    db.put(b"foo", b"bar")
+    # WHEN overwriting it
+    db.put(b"foo", b"qux")
+    # THEN the new value should be read back
+    assert db.get(b"foo") == b"qux"
 
 
 def test_delete_nonexistent(db):
@@ -138,3 +147,19 @@ def test_scan_inclusive_exclusive_bounded(db):
     assert list(db.scan(b"baa", b"foo")) == [(b"baz", b"qux")]
     assert list(db.scan(b"bba", b"fop")) == [(b"foo", b"bar")]
     assert list(db.scan(b"foo", b"foo")) == []
+
+
+def test_all_keys_and_values_must_be_bytes(db):
+    msg = "must have the bytes type"
+    with pytest.raises(TypeError, match=msg):
+        db.put("foo", b"bar")
+    with pytest.raises(TypeError, match=msg):
+        db.put(b"foo", "bar")
+    with pytest.raises(TypeError, match=msg):
+        db.delete("foo")
+    with pytest.raises(TypeError, match=msg):
+        db.get("foo")
+    with pytest.raises(TypeError, match=msg):
+        db.scan("foo", None)
+    with pytest.raises(TypeError, match=msg):
+        db.scan(None, "foo")

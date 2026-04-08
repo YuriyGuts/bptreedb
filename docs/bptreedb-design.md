@@ -398,7 +398,7 @@ The cost: dirty pages occupy buffer-pool space until the next checkpoint. To bou
 3. When `db.close()` is called.
 4. Manually via `db.checkpoint()`.
 
-Both thresholds are constructor parameters of `DB.open` (see Section 7.1).
+Both thresholds are constructor parameters of `DB` (see Section 7.1).
 
 ### 6.2 LSN bookkeeping
 
@@ -406,7 +406,7 @@ Every dirty page records `last_modified_lsn` in its header — the LSN of the mo
 
 ### 6.3 Recovery procedure
 
-Triggered by `DB.open()`. Sequence:
+Triggered when opening the DB (entering a `with DB(...) as db:` block, or calling `db.open()` explicitly). Sequence:
 
 1. **Read meta page (page 0).** Verify `magic`, `version`, and `crc32`. On any mismatch, raise `DBCorruptError`.
 2. **Initialise the in-memory tree object** pointing at `meta.root_page_id`, with `freelist_head` and `next_page_id` taken from the meta page.
@@ -420,7 +420,7 @@ Triggered by `DB.open()`. Sequence:
 7. **Take an immediate checkpoint** to persist the recovered state and re-enable normal eviction.
 8. The DB is now open.
 
-Recovery is **idempotent and restartable**: a crash during step 5 or 6 leaves the data file unchanged from the previous checkpoint, and the next `open()` will repeat steps 1–6 to the same effect.
+Recovery is **idempotent and restartable**: a crash during step 5 or 6 leaves the data file unchanged from the previous checkpoint, and the next open will repeat steps 1–6 to the same effect.
 
 ### 6.4 Checkpoint procedure
 
@@ -449,17 +449,24 @@ The "idempotent across an already-applied checkpoint window" property in row 2 d
 ### 7.1 The `DB` class
 
 ```python
-DB.open(
+DB(
     dir_path: str | Path,
     *,
     page_size_bytes: int = 4096,
     cache_capacity_pages: int = 256,
     checkpoint_wal_size_bytes: int = 4 * 1024 * 1024,
     checkpoint_dirty_page_ratio: float = 0.5,
-) -> DB
+)
 ```
 
-Opens or creates a database in the directory `dir_path`. The directory contains exactly two files: `data.db` and `wal.log` (see Section 4.1). On open, validates the meta page, runs recovery if the WAL is non-empty, and takes an initial checkpoint. If the directory does not exist, it is created with an empty tree (a single empty leaf as the root). If the directory exists but contains files other than `data.db` and `wal.log`, `DBCorruptError` is raised.
+Constructs a `DB` handle for the directory `dir_path`. The handle is used as a context manager:
+
+```python
+with DB(dir_path) as db:
+    db.put(b"k", b"v")
+```
+
+Entering the context (or calling `db.open()` explicitly) opens or creates the database. The directory contains exactly two files: `data.db` and `wal.log` (see Section 4.1). On open, validates the meta page, runs recovery if the WAL is non-empty, and takes an initial checkpoint. If the directory does not exist, it is created with an empty tree (a single empty leaf as the root). If the directory exists but contains files other than `data.db` and `wal.log`, `DBCorruptError` is raised. Exiting the context calls `db.close()`.
 
 Parameters:
 

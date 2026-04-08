@@ -39,14 +39,15 @@ Every parameter, every exception class, every method, every field exists in the 
 
 | Concept | Earned in |
 |---|---|
-| `DB.open()` (no args) | Iter 1 |
+| `DB()` constructor + context manager (no args) | Iter 1 |
 | `put` / `get` / `delete` / `scan` / `close` / context manager | Iter 1 |
-| `DBClosedError`, `DBConcurrentModificationError` | Iter 1 |
-| Type checks (`bytes` only) → built-in `ValueError` | Iter 1 |
+| `DBClosedError` | Iter 1 |
+| Type checks (`bytes` only) → built-in `TypeError` | Iter 1 |
 | `dir_path` parameter | Iter 2 |
 | `DBCorruptError` | Iter 2 |
 | `page_size_bytes` parameter | Iter 3 |
 | `DBRecordTooLargeError` and the size limit | Iter 3 |
+| `DBConcurrentModificationError` and `_version_counter` | Iter 3 |
 | `last_modified_lsn` page-header field | Iter 4 |
 | `cache_capacity_pages` parameter | Iter 4 |
 | `checkpoint()` method, `last_checkpoint_lsn` meta field | Iter 5 |
@@ -71,17 +72,17 @@ Because the API is the contract. Every later iteration is a *re-implementation* 
 
 A package skeleton with `uv`, `ruff`, `ty`, `pytest`. The `src/bptreedb/` layout with these modules:
 
-- `errors.py` — `DBError(Exception)` as the base class, plus two subclasses: `DBClosedError` and `DBConcurrentModificationError`. Re-export from `__init__.py`.
+- `errors.py` — `DBError(Exception)` as the base class, plus one subclass: `DBClosedError`. Re-export from `__init__.py`. (`DBConcurrentModificationError` is deferred to Iteration 3, where the on-disk tree's lazy iterator makes mid-scan mutation actually unsafe.)
 - `db.py` — the `DB` class.
 - `_inmem.py` — a tiny in-memory backing store. Use `sortedcontainers.SortedDict` (add `sortedcontainers` to dependencies) or a plain `dict` with sorted iteration. The whole module is maybe 30 lines.
 
 The `DB` class:
 
-- `DB.open()` — no arguments. Returns a fresh `DB` instance.
-- `put(key, value)` — raises `ValueError` if either argument is not `bytes`. Otherwise inserts into the in-memory dict and bumps `_version_counter`.
+- `DB()` — no arguments. Constructs a fresh `DB` instance. Used as a context manager: `with DB() as db: ...`. Entering the context performs the open work; exiting calls `close()`. Manual `db.open()` and `db.close()` methods are also exposed for callers who don't want to use a `with`-statement.
+- `put(key, value)` — raises `TypeError` if either argument is not `bytes`. Otherwise inserts into the in-memory dict.
 - `get(key)` — looks up in the in-memory dict; returns the value or `None`.
-- `delete(key)` — removes from the in-memory dict; returns `True` if it was present, `False` otherwise; bumps `_version_counter` on a successful removal.
-- `scan(start_key_inclusive=None, end_key_exclusive=None)` — returns a generator yielding `(key, value)` pairs in sorted order over the half-open range. The generator captures `_version_counter` at construction; before each `next()` it checks the counter and raises `DBConcurrentModificationError` if it changed.
+- `delete(key)` — removes from the in-memory dict; returns `True` if it was present, `False` otherwise.
+- `scan(start_key_inclusive, end_key_exclusive)` — returns a generator yielding `(key, value)` pairs in sorted order over the half-open range. Both bounds are required (no defaults) — callers must be explicit about the scan range, and pass `None` for an unbounded side. **The behaviour of mutating the DB while a scan is in flight is undefined in this iteration; it will become a `DBConcurrentModificationError` in Iteration 3.** Document this in the method's docstring so callers don't accidentally rely on the underlying `SortedDict`'s behaviour.
 - `close()` — sets a `_closed` flag; subsequent calls to any other public method raise `DBClosedError`.
 - `__enter__` / `__exit__` — context manager support; `__exit__` calls `close()`.
 
@@ -91,7 +92,7 @@ All tests live under `tests/`. You will keep adding to these as you go; nothing 
 
 **The `db` fixture in `tests/conftest.py`:**
 
-A pytest fixture that yields a fresh, open DB. Its body is `with DB.open() as db: yield db`. Test bodies use this fixture instead of constructing `DB` directly, so that they don't have to know how a `DB` is opened.
+A pytest fixture that yields a fresh, open DB. Its body is `with DB() as db: yield db`. Test bodies use this fixture instead of constructing `DB` directly, so that they don't have to know how a `DB` is opened.
 
 **Unit tests for the API surface (`tests/unit/test_api.py`):**
 
@@ -101,18 +102,15 @@ Test bodies use the `db` fixture. None of the tests touch the constructor direct
 - `put` overwrites: re-putting the same key with a new value, then `get`, returns the new value.
 - `delete` of a present key returns `True`; subsequent `get` returns `None`.
 - `delete` of an absent key returns `False`.
-- `put` with a non-`bytes` key raises `ValueError`.
-- `put` with a non-`bytes` value raises `ValueError`.
+- `put` with a non-`bytes` key raises `TypeError`.
+- `put` with a non-`bytes` value raises `TypeError`.
 - `scan` over an empty DB yields nothing.
 - `scan` with no bounds yields all `(key, value)` pairs in ascending key order.
 - `scan` with `start_key_inclusive` skips keys strictly less than the bound.
 - `scan` with `end_key_exclusive` skips keys greater than or equal to the bound.
 - `scan` with both bounds yields only the half-open range.
-- `scan` followed by `put` raises `DBConcurrentModificationError` on the next `next()`.
-- `scan` followed by `delete` raises likewise.
-- `scan` followed by `get` does NOT raise (search is not a mutation).
 - After `close`, every public method raises `DBClosedError`.
-- Context manager: a small handful of tests construct `DB.open()` directly (without the fixture) to verify `__enter__`/`__exit__` behaviour. Keep them isolated; they're the only tests that touch the constructor directly.
+- Context manager: a small handful of tests construct `DB()` directly (without the fixture) to verify `__enter__`/`__exit__` behaviour. Keep them isolated; they're the only tests that touch the constructor directly.
 
 **Property test (`tests/property/test_dict_equivalence.py`):**
 
@@ -126,7 +124,7 @@ A working in-process key-value store you can `pip install -e .` and use from a R
 
 ```
 from bptreedb import DB
-with DB.open() as db:
+with DB() as db:
     db.put(b"a", b"1")
     db.put(b"b", b"2")
     list(db.scan())   # → [(b"a", b"1"), (b"b", b"2")]
@@ -152,12 +150,11 @@ Because in Iteration 1 you have no durability at all. Before you build any compl
 
 ### What you build
 
-**The constructor signature changes for the first time.** `DB.open()` becomes `DB.open(dir_path)` — `dir_path` is required because the API now has a place to persist things to. Update the `db` fixture in `tests/conftest.py` to take `tmp_path` and call `DB.open(tmp_path)`. Update the two or three tests that constructed `DB.open()` directly. Every other test body is unchanged.
+**The constructor signature changes for the first time.** `DB()` becomes `DB(dir_path)` — `dir_path` is required because the API now has a place to persist things to. Update the `db` fixture in `tests/conftest.py` to take `tmp_path` and call `DB(tmp_path)`. Update the two or three tests that constructed `DB()` directly. Every other test body is unchanged.
 
-**A new exception is earned.** `DBCorruptError` is added to `errors.py` and re-exported from `__init__.py`. It is raised in two situations introduced in this iteration:
+**A new exception is earned.** `DBCorruptError` is added to `errors.py` and re-exported from `__init__.py`. It is raised when a WAL CRC check fails *somewhere other than the torn tail* — i.e., a record fails its CRC check but is followed by a record that passes. A torn tail at the end of the file is silently truncated (the user was never told about anything beyond the last fsync); a CRC failure followed by valid records is genuine corruption and we raise.
 
-- The directory exists but contains files other than `wal.log`. (We don't know what they are; we won't touch them.)
-- A WAL CRC check fails *somewhere other than the torn tail* — i.e., a record fails its CRC check but is followed by a record that passes. A torn tail at the end of the file is silently truncated (the user was never told about anything beyond the last fsync); a CRC failure followed by valid records is genuine corruption and we raise.
+We deliberately do **not** police the contents of `dir_path`. If the directory contains files we don't recognise, that's the user's business — foreign files don't corrupt the DB, and refusing to open in their presence would just be officious. The DB only owns the files it created.
 
 A new module:
 
@@ -192,14 +189,14 @@ Why each piece exists, justified now:
 - **`crc32`** — so the replayer can detect a record that was partially written (or otherwise corrupted) before its `fsync` completed. Without the CRC, you cannot distinguish a half-written torn record at the end of the log from a complete one.
 - **`fsync`** — without it, "the OS has buffered your write" is *not* the same as "your write is on disk." A power loss or kernel panic between `write` and `fsync` loses everything in the OS buffer. Calling `fsync` before returning from `put` is the *only* thing that lets you tell the user "your write is durable."
 
-In `db.py`, modify `DB.open`, `DB.put`, and `DB.delete`:
+In `db.py`, modify the `DB` open path, `DB.put`, and `DB.delete`:
 
-- `open(dir_path)` creates the directory if it doesn't exist; if it exists, validates that it contains only files this iteration knows about (just `wal.log` for now). Foreign files raise `DBCorruptError`. Then instantiates a `WAL` and immediately calls `wal.replay()` on it, applying each record to the in-memory dict. The dict is now seeded with the prior history.
+- `DB(dir_path)` stores the path; the actual open work happens in `__enter__` (or in an explicit `db.open()` method that `__enter__` delegates to). Opening creates the directory if it doesn't exist. Then instantiates a `WAL` and immediately calls `wal.replay()` on it, applying each record to the in-memory dict. The dict is now seeded with the prior history. (No foreign-file check — see the note above on why we don't police directory contents.)
 - `put` calls `wal.append_put(key, value)` and `wal.fsync()` *before* it touches the in-memory dict. This is the discipline of write-ahead logging: you log the change before you make the change.
 - `delete` does the symmetric thing.
 - `close` calls `wal.fsync()` once more (in case anything was buffered) and closes the WAL file.
 
-Also, **the `_file_factory` test hook**. Add a private `_file_factory` parameter to `WAL.__init__` (and thread it through `DB.open` as a private parameter `_file_factory`, undocumented in the public API). It defaults to `open(...)`. Tests will use it to inject a `FaultyFile`. Yes, this is a private wart on the public class — that's the price of property-based crash testing without monkey-patching.
+Also, **the `_file_factory` test hook**. Add a private `_file_factory` parameter to `WAL.__init__` (and thread it through `DB.__init__` as a private parameter `_file_factory`, undocumented in the public API). It defaults to `open(...)`. Tests will use it to inject a `FaultyFile`. Yes, this is a private wart on the public class — that's the price of property-based crash testing without monkey-patching.
 
 The `FaultyFile` test fixture lives in `tests/conftest.py` (or `tests/crash/conftest.py`):
 
@@ -269,10 +266,21 @@ Replace the in-memory dict with a paged file containing a B+ tree. The dataset i
 
 This is the iteration where the database stops being a dict-with-a-log and starts being a database. It's the largest and most interesting iteration. You will build the slotted page format, the pager, and the tree algorithms; you will throw away `_inmem.py`; and at the end every existing test will still pass *unchanged*, because the public API is the contract.
 
-**Two new things on the API surface earn their place here:**
+**Three new things on the API surface earn their place here:**
 
-1. **`page_size_bytes` parameter on `DB.open`.** Now that the database has pages, the page size is a real configurable. Default 4096; honoured only on creation (an existing DB uses its stored page size). Update the `db` fixture in `tests/conftest.py` to pass `page_size_bytes=256` so that splits and merges happen often in tests.
+1. **`page_size_bytes` parameter on the `DB` constructor.** Now that the database has pages, the page size is a real configurable. Default 4096; honoured only on creation (an existing DB uses its stored page size). Update the `db` fixture in `tests/conftest.py` to pass `page_size_bytes=256` so that splits and merges happen often in tests.
 2. **`DBRecordTooLargeError`.** Now that there's a maximum record size (`(page_size_bytes - HEADER_SIZE) // 4 - SLOT_SIZE`), `put` enforces it. The error class is added to `errors.py` and re-exported.
+3. **`DBConcurrentModificationError` and `_version_counter`.** Now that `scan` returns a *real* lazy iterator that walks leaf pages via `right_sibling`, mutating the tree mid-scan is genuinely unsafe — a `put` between two `next()` calls can split the leaf the iterator is sitting on, move records, and rewrite sibling pointers. The iterator's "I am at slot N of leaf page P" state stops being meaningful. The version counter is the cheap, honest fix: the iterator snapshots a counter at construction and re-checks it on every `next()`. The error class is added to `errors.py` and re-exported.
+
+   Implementation details:
+
+   - `DB.__init__` adds `self._version_counter = 0`.
+   - `DB.put` bumps the counter at the end of every successful insert.
+   - `DB.delete` bumps the counter only when the key was actually present (return value `True`). A failed `delete` is not a mutation and must not invalidate live iterators.
+   - `DB.get` does NOT bump the counter — search is not a mutation.
+   - `DB.scan` snapshots `self._version_counter` at the top, then checks it at the top of each loop iteration before yielding. The check belongs at the top of the loop body, which is the code that runs *after* the consumer's `next()` resumes the generator and *before* the next value is produced.
+   - The check fires on the *first* `next()` too, so a mutation between iterator construction and the first `next()` raises.
+   - `_replay_wal` must NOT go through `put` / `delete` (which would bump the counter). Apply records to the tree directly inside the replay loop and leave the counter alone.
 
 I am going to walk you through this iteration in three sub-steps. Each sub-step is its own pass through the code with its own commit. The order matters: the page codec is purely functional and easy to test, the pager builds on it, and the tree builds on the pager. **Within each sub-step, I will introduce only the on-disk fields you need at this iteration.** Fields like `last_modified_lsn`, `last_checkpoint_lsn`, and `freelist_head` will *not* exist after this iteration — they get added in Iterations 4, 5, and 6, when the iterations themselves explain why they have to.
 
@@ -348,7 +356,6 @@ Total: 36 bytes. **No `last_checkpoint_lsn` yet** — there is no checkpoint. **
 The `Pager` class:
 
 - Constructor: `Pager(dir_path, *, page_size_bytes=None, _file_factory=None)`. If `data.db` doesn't exist, create it with one page (the meta page) describing an empty tree where `root_page_id` points to a freshly initialised leaf at page 1; bump-allocate that leaf and write it. If the file exists, decode and verify the meta page.
-- If `dir_path` contains files other than `data.db` and `wal.log`, raise `DBCorruptError`.
 - `read_page(page_id) -> bytes` — seek + read.
 - `write_page(page_id, data) -> None` — seek + write. No fsync.
 - `fsync() -> None` — `os.fsync` on the data file.
@@ -368,7 +375,6 @@ Two important calls about behaviour at this iteration:
 - Create new database in a fresh directory: succeeds, creates `data.db`, page 0 decodes to a valid meta with the requested `page_size_bytes` and `root_page_id == 1`.
 - Reopen existing database: succeeds, decodes existing meta.
 - Reopen with conflicting `page_size_bytes` is silently ignored (the file's value wins).
-- Foreign files in the directory raise `DBCorruptError`.
 - Tampered meta page CRC raises `DBCorruptError`.
 - `write_page` then `read_page` round-trips.
 - `update_meta` then `get_meta` reflects the change without touching disk.
@@ -429,8 +435,8 @@ For brevity I'll group these — refer to spec §5 for the algorithm details and
 Now in `db.py`:
 
 - Delete `_inmem.py`. (This is the only throwaway in the entire project.)
-- Construct a `Pager` and a `BTree` in `DB.open` after the `WAL`.
-- After the `WAL.replay()` call in `open`, the records are now applied to the *tree* instead of the in-memory dict. Each PUT in the WAL becomes `tree.insert(key, value)`; each DELETE becomes `tree.delete(key)`. The tree starts empty (the meta page's `root_page_id` points to an empty leaf created by the pager constructor).
+- Construct a `Pager` and a `BTree` in the `DB` open path (after the `WAL`).
+- After the `WAL.replay()` call, the records are now applied to the *tree* instead of the in-memory dict. Each PUT in the WAL becomes `tree.insert(key, value)`; each DELETE becomes `tree.delete(key)`. The tree starts empty (the meta page's `root_page_id` points to an empty leaf created by the pager constructor).
 - `put` still appends to the WAL and fsyncs, then calls `tree.insert`. Same pattern as before, just with a different backing structure.
 - `delete` likewise.
 - `get` becomes `tree.search`.
@@ -444,6 +450,16 @@ Now in `db.py`:
 - All Iteration 2 persistence and crash tests still pass — also unchanged. The WAL is the same, the recovery procedure is the same, only what gets replayed into has changed.
 - All new `test_page.py`, `test_pager.py`, `test_tree.py` tests pass.
 - `assert_tree_invariants` passes after every operation in the property test that uses it.
+
+**New unit tests for the version counter** (added to `tests/unit/test_db.py`):
+
+- `scan` followed by `put` raises `DBConcurrentModificationError` on the next `next()`.
+- `scan` followed by a *successful* `delete` raises likewise.
+- `scan` followed by a `delete` of an absent key (returns `False`) does NOT raise — failed deletes are not mutations.
+- `scan` followed by `get` does NOT raise — search is not a mutation.
+- Partial-iteration test: consume the first item from a multi-item scan, then `put`, then assert the next `next()` raises. This proves the check runs on every step, not just the first.
+- Mutation between iterator construction and the first `next()` also raises.
+- After a failed mutation (e.g., `put` with a non-`bytes` argument that raises `TypeError`), a previously constructed scan still works — the counter must not bump on the failure path.
 
 If any Iteration 1 or 2 test breaks, you have changed the contract — go fix the implementation, not the test.
 
@@ -476,7 +492,7 @@ Because Iteration 3 left you with a database where every read and every write go
 
 ### What you build
 
-**A new constructor parameter earns its place:** `cache_capacity_pages` on `DB.open`, default 256. This is the capacity of the buffer pool that exists for the first time in this iteration.
+**A new constructor parameter earns its place:** `cache_capacity_pages` on `DB`, default 256. This is the capacity of the buffer pool that exists for the first time in this iteration.
 
 A new module: `cache.py`. A new test file: `tests/unit/test_cache.py`. Modifications to `pager.py` (or the tree's pager interface) so that all page reads and writes go through the cache.
 
@@ -508,7 +524,7 @@ In the tree (`tree.py`), modify every place that previously called `pager.read_p
 
 In `db.py`:
 
-- Construct a `BufferPool` wrapping the pager in `DB.open`.
+- Construct a `BufferPool` wrapping the pager in the `DB` open path.
 - The tree is given the buffer pool, not the pager directly. (The pager is still used by the buffer pool internally.)
 - `close` calls `buffer_pool.flush_all()` before `pager.fsync()`, so all dirty pages are persisted on shutdown. (`pager.flush_meta` and `pager.close` come after.)
 - `_debug` namespace (in `_debug.py`) gains `dirty_pages_in_cache()` and `total_pages_in_file()` for tests.
@@ -551,8 +567,8 @@ Because Iteration 4 left you with an unbounded WAL. Recovery scales linearly wit
 **Three things on the API surface earn their place here:**
 
 1. **`db.checkpoint()` method.** Public method on `DB` that forces a checkpoint immediately. Used by tests and by users who want to tighten the recovery window before shutdown.
-2. **`checkpoint_wal_size_bytes` parameter** on `DB.open`, default 4 MiB. Auto-checkpoint trigger: when the WAL grows past this size, the next put/delete triggers a checkpoint.
-3. **`checkpoint_dirty_page_ratio` parameter** on `DB.open`, default 0.5. Auto-checkpoint trigger: when the fraction of dirty pages in the buffer pool exceeds this ratio, the next put/delete triggers a checkpoint.
+2. **`checkpoint_wal_size_bytes` parameter** on `DB`, default 4 MiB. Auto-checkpoint trigger: when the WAL grows past this size, the next put/delete triggers a checkpoint.
+3. **`checkpoint_dirty_page_ratio` parameter** on `DB`, default 0.5. Auto-checkpoint trigger: when the fraction of dirty pages in the buffer pool exceeds this ratio, the next put/delete triggers a checkpoint.
 
 In `wal.py`:
 
@@ -582,7 +598,7 @@ Also implement the **automatic checkpoint triggers** from spec §6.1:
 - When `tree.insert` raises `BufferPoolFull`, call `checkpoint()` and retry once.
 - When `db.close()` is called.
 
-And implement the **recovery procedure** from spec §6.3 in `DB.open`:
+And implement the **recovery procedure** from spec §6.3 in the `DB` open path (i.e., `__enter__` / `db.open()`):
 
 1. The pager has already validated the meta page in its constructor. (If the CRC fails, `DBCorruptError` is raised there.)
 2. Construct the tree from `meta.root_page_id`. Construct the WAL.
@@ -756,9 +772,10 @@ Quick map of spec sections to iterations, so you can verify that nothing in the 
 | §7.1 `page_size_bytes` parameter   | Iter 3                                              |
 | §7.1 `cache_capacity_pages` parameter | Iter 4                                           |
 | §7.1 `checkpoint()` + checkpoint parameters | Iter 5                                     |
-| §7.2 `DBClosedError`, `DBConcurrentModificationError` | Iter 1                    |
+| §7.2 `DBClosedError`               | Iter 1                                              |
 | §7.2 `DBCorruptError`              | Iter 2                                              |
 | §7.2 `DBRecordTooLargeError`       | Iter 3                                              |
+| §7.2 `DBConcurrentModificationError` | Iter 3 (deferred from Iter 1 — earned only once `scan` is a real lazy iterator) |
 | §7.4 `_debug` namespace            | Iter 3 onward, growing as needed                    |
 | §8.1–8.4 Test categories           | Iter 1 (unit, property), Iter 2 (crash), all later iterations add more |
 | §8.5 `FaultyFile` infrastructure   | Iter 2                                              |

@@ -49,6 +49,7 @@ select = [
     "ANN",      # tests: no type annotations required
     "D",        # tests: no docstrings required
     "PLR2004",  # tests: magic numbers are fine
+    "SIM117",   # tests: fine to use nested `with` statements for readability
 ]
 
 [tool.ty.src]
