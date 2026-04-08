@@ -11,6 +11,7 @@ from bptreedb.entities import WALDeleteRecord
 from bptreedb.entities import WALPutRecord
 from bptreedb.entities import WALRecord
 from bptreedb.exceptions import DBClosedError
+from bptreedb.exceptions import DBConcurrentPageModificationError
 from bptreedb.fs import fsync_directory
 from bptreedb.wal import WAL
 
@@ -18,11 +19,30 @@ WAL_FILENAME = "bptreedb.wal"
 
 
 class DB:
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(
+        self,
+        data_dir: str | Path,
+        page_size_bytes: int = 4096,
+    ) -> None:
+        """
+        Create a new DB instance.
+
+        Parameters
+        ----------
+        data_dir
+            The directory where the data will be stored.
+            Automatically created on `.open()` if it does not exist.
+        page_size_bytes
+            The size of the page in bytes.
+            Applies only to newly created databases; existing ones will use the page size
+            stored in the metadata.
+        """
         self.data_dir = Path(data_dir)
+        self.page_size_bytes = page_size_bytes
         self.wal = WAL(self.data_dir / WAL_FILENAME)
         self.data = SortedDict()
         self.is_opened = False
+        self._version_counter = 0
 
     def open(self) -> None:
         dir_already_existed = self.data_dir.exists()
@@ -73,7 +93,7 @@ class DB:
 
     def _ensure_bytes_type(self, value: bytes, param_name: str) -> None:
         if not isinstance(value, bytes):
-            raise TypeError(f"{param_name} must have the bytes type")  # noqa: TRY003
+            raise TypeError(f"{param_name} must have the bytes type")
 
     def put(self, key: bytes, value: bytes) -> None:
         self._check_if_opened()
@@ -81,6 +101,7 @@ class DB:
         self._ensure_bytes_type(value, "value")
         self.wal.append_put(key, value)
         self.data[key] = value
+        self._version_counter += 1
 
     def get(self, key: bytes) -> bytes | None:
         self._check_if_opened()
@@ -93,6 +114,7 @@ class DB:
         if key in self.data:
             self.wal.append_delete(key)
             del self.data[key]
+            self._version_counter += 1
             return True
         return False
 
@@ -116,10 +138,13 @@ class DB:
         start_key_inclusive: bytes | None,
         end_key_exclusive: bytes | None,
     ) -> Iterator[tuple[bytes, bytes]]:
+        version_snapshot = self._version_counter
         key_iter = self.data.irange(
             start_key_inclusive,
             end_key_exclusive,
             inclusive=(True, False),
         )
         for key in key_iter:
+            if self._version_counter != version_snapshot:
+                raise DBConcurrentPageModificationError()
             yield key, self.data[key]

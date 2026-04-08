@@ -6,19 +6,29 @@ from struct import Struct
 from typing import IO
 from typing import Any
 
+from bptreedb.entities import DATA_FILE_MAGIC_PREFIX
+from bptreedb.entities import DATA_FILE_VERSION
+from bptreedb.entities import InternalPage
+from bptreedb.entities import InternalSlot
+from bptreedb.entities import LeafPage
+from bptreedb.entities import LeafSlot
+from bptreedb.entities import MetaPage
 from bptreedb.entities import WALDeleteRecord
 from bptreedb.entities import WALPutRecord
 from bptreedb.entities import WALRecord
 from bptreedb.exceptions import DBChecksumError
+from bptreedb.exceptions import DBCorruptedError
 
-_LENGTH_FIELD = Struct("<I")
-_CRC32_FIELD = Struct("<I")
+_UINT32_FIELD = Struct("<I")
+_UINT64_FIELD = Struct("<Q")
+_LENGTH_FIELD = _UINT32_FIELD
+_CRC32_FIELD = _UINT32_FIELD
+_PAGE_ID_FIELD = _UINT64_FIELD
+
 _WAL_RECORD_HEADER = Struct("<QB")
-
-
-class WALOperationType(IntEnum):
-    PUT = 0x01
-    DELETE = 0x02
+_META_PAGE_NO_CRC = Struct("<8sIIQQ")
+_PAGE_HEADER = Struct("<B3sIIIQ")
+_SLOT_ENTRY = Struct("<II")
 
 
 class BufferReader:
@@ -82,6 +92,9 @@ class BufferWriter:
         self.write_struct(length_spec, length)
         self.write_bytes(value)
 
+    def write_crc32(self) -> None:
+        self.write_struct(_CRC32_FIELD, self.crc32())
+
     def tell(self) -> int:
         return len(self._buffer)
 
@@ -105,6 +118,20 @@ def verify_crc32(data: bytes) -> None:
         raise DBChecksumError(expected_crc32, actual_crc32)
 
 
+def max_record_body_size(page_size_bytes: int) -> int:
+    return (page_size_bytes - 24) // 4 - 8
+
+
+class WALOperationType(IntEnum):
+    PUT = 0x01
+    DELETE = 0x02
+
+
+class PageType(IntEnum):
+    INTERNAL = 0x01
+    LEAF = 0x02
+
+
 def encode_wal_record(record: WALRecord) -> bytes:
     header_writer = BufferWriter()
     payload_writer = BufferWriter()
@@ -118,18 +145,18 @@ def encode_wal_record(record: WALRecord) -> bytes:
             op_type = WALOperationType.DELETE
             payload_writer.write_length_prefixed_bytes(record.key)
         case _:
-            raise ValueError(f"Unknown operation type {type(record)}")  # noqa: TRY003
+            raise ValueError(f"Unknown operation type {type(record)}")
 
     header_writer.write_struct(_WAL_RECORD_HEADER, record.lsn, op_type)
     length_field_value = len(header_writer) + len(payload_writer) + _CRC32_FIELD.size
 
-    result_writer = BufferWriter()
-    result_writer.write_struct(_LENGTH_FIELD, length_field_value)
-    result_writer.write_bytes(header_writer)
-    result_writer.write_bytes(payload_writer)
-    result_writer.write_struct(_CRC32_FIELD, result_writer.crc32())
+    record_writer = BufferWriter()
+    record_writer.write_struct(_LENGTH_FIELD, length_field_value)
+    record_writer.write_bytes(header_writer)
+    record_writer.write_bytes(payload_writer)
+    record_writer.write_crc32()
 
-    return bytes(result_writer)
+    return bytes(record_writer)
 
 
 def decode_wal_record(data: bytes) -> WALRecord:
@@ -147,7 +174,7 @@ def decode_wal_record(data: bytes) -> WALRecord:
             key = reader.read_length_prefixed_bytes()
             return WALDeleteRecord(lsn=lsn, key=key)
         case _:
-            raise ValueError(f"Unknown operation type {op_type}")  # noqa: TRY003
+            raise ValueError(f"Unknown operation type {op_type}")
 
 
 def decode_next_wal_record_from_file(file: IO[bytes]) -> WALRecord:
@@ -164,3 +191,123 @@ def decode_next_wal_record_from_file(file: IO[bytes]) -> WALRecord:
         raise EOFError()
 
     return decode_wal_record(length_bytes + record_body)
+
+
+def encode_meta_page(page: MetaPage) -> bytes:
+    writer = BufferWriter()
+    writer.write_struct(
+        _META_PAGE_NO_CRC,
+        DATA_FILE_MAGIC_PREFIX,
+        DATA_FILE_VERSION,
+        page.page_size_bytes,
+        page.root_page_id,
+        page.next_page_id,
+    )
+    writer.write_crc32()
+    zero_padding = bytes(page.page_size_bytes - len(writer))
+    return bytes(writer) + zero_padding
+
+
+def decode_meta_page(data: bytes) -> MetaPage:
+    data = data[: _META_PAGE_NO_CRC.size + _CRC32_FIELD.size]
+
+    if data[: len(DATA_FILE_MAGIC_PREFIX)] != DATA_FILE_MAGIC_PREFIX:
+        raise DBCorruptedError("Magic prefix not found")
+    verify_crc32(data)
+
+    reader = BufferReader(data)
+    unpacked = reader.read_struct(_META_PAGE_NO_CRC)
+    return MetaPage(
+        magic=unpacked[0],
+        version=unpacked[1],
+        page_size_bytes=unpacked[2],
+        root_page_id=unpacked[3],
+        next_page_id=unpacked[4],
+    )
+
+
+def encode_page(page: InternalPage | LeafPage, page_size_bytes: int) -> bytes:
+    page_buffer = bytearray(page_size_bytes)
+    record_end_ptr = len(page_buffer)
+    slot_writer = BufferWriter()
+
+    for slot in page.slots:
+        record_writer = BufferWriter()
+        match slot:
+            case InternalSlot():
+                record_writer.write_length_prefixed_bytes(slot.key)
+                record_writer.write_struct(_PAGE_ID_FIELD, slot.child_page_id)
+            case LeafSlot():
+                record_writer.write_length_prefixed_bytes(slot.key)
+                record_writer.write_length_prefixed_bytes(slot.value)
+            case _:
+                raise ValueError(f"Unknown slot type {slot}")
+
+        record = bytes(record_writer)
+        record_end_ptr -= len(record)
+        page_buffer[record_end_ptr : record_end_ptr + len(record)] = record
+        slot_writer.write_struct(_SLOT_ENTRY, record_end_ptr, len(record))
+
+    match page:
+        case InternalPage():
+            page_type = PageType.INTERNAL
+            page_id_field_value = page.leftmost_child_page_id
+        case LeafPage():
+            page_type = PageType.LEAF
+            page_id_field_value = page.right_sibling_page_id
+        case _:
+            raise ValueError(f"Unknown page type {page}")
+
+    free_space_start = _PAGE_HEADER.size + _SLOT_ENTRY.size * len(page.slots)
+    free_space_end = record_end_ptr
+
+    header_writer = BufferWriter()
+    header_writer.write_struct(
+        _PAGE_HEADER,
+        page_type,
+        bytes(3),
+        len(page.slots),
+        free_space_start,
+        free_space_end,
+        page_id_field_value,
+    )
+
+    page_buffer[0 : len(header_writer)] = bytes(header_writer)
+    page_buffer[len(header_writer) : len(header_writer) + len(slot_writer)] = bytes(slot_writer)
+    return bytes(page_buffer)
+
+
+def decode_page(data: bytes) -> InternalPage | LeafPage:
+    reader = BufferReader(data)
+    page_type, _, slot_count, free_space_start, free_space_end, page_id_field_value = (
+        reader.read_struct(_PAGE_HEADER)
+    )
+    match page_type:
+        case PageType.INTERNAL:
+            slots = []
+            for _ in range(slot_count):
+                record_offset, record_length = reader.read_struct(_SLOT_ENTRY)
+                record = data[record_offset : record_offset + record_length]
+                record_reader = BufferReader(record)
+                key = record_reader.read_length_prefixed_bytes()
+                child_page_id = record_reader.read_struct(_PAGE_ID_FIELD)[0]
+                slots.append(InternalSlot(key=key, child_page_id=child_page_id))
+            return InternalPage(
+                leftmost_child_page_id=page_id_field_value,
+                slots=slots,
+            )
+        case PageType.LEAF:
+            slots = []
+            for _ in range(slot_count):
+                record_offset, record_length = reader.read_struct(_SLOT_ENTRY)
+                record = data[record_offset : record_offset + record_length]
+                record_reader = BufferReader(record)
+                key = record_reader.read_length_prefixed_bytes()
+                value = record_reader.read_length_prefixed_bytes()
+                slots.append(LeafSlot(key=key, value=value))
+            return LeafPage(
+                right_sibling_page_id=page_id_field_value,
+                slots=slots,
+            )
+        case _:
+            raise ValueError(f"Unknown page type {page_type}")

@@ -1,12 +1,24 @@
 # bptreedb Implementation Plan
 
-> **Audience:** A human implementer learning how databases work, who wants every piece of machinery to earn its place. No literal source code in this document — descriptions and behaviours only. The full architecture lives in the spec at `docs/superpowers/specs/2026-04-07-bptreedb-design.md`; this plan is the *journey* to that architecture.
+> **Audience:** A human implementer learning how databases work, who wants every piece of machinery to earn its place. **This document is designed to be self-contained.** You should be able to read it top-to-bottom and implement each iteration without flipping over to the design spec. The design spec (`docs/bptreedb-design.md`) exists as a reference for architectural *justification* — why the policy is NO-STEAL, why recovery is idempotent, why the half-full rule is 40% — but the plan below spells out every on-disk layout, every class API, and every algorithm you need to type into the editor.
 
-**Goal:** Build a single-process, crash-safe B+ tree key-value store in Python by walking from "the simplest thing that satisfies the public API" to "the architecture in the spec," motivating every layer and every on-disk field at the moment it earns its existence.
+**Goal:** Build a single-process, crash-safe B+ tree key-value store in Python by walking from "the simplest thing that satisfies the public API" to "a real database," motivating every module and every on-disk field at the moment it earns its existence.
 
 **Tech stack:** Python 3.12+, `uv`, `pytest`, `hypothesis`, `ruff`, `ty`.
 
 **Working assumption:** the project lives in a fresh directory (e.g., `bptreedb/`) which is a git repository. All file paths in this plan are relative to that directory.
+
+## The core decomposition (the thing that stays stable across every iteration)
+
+Before the iterations themselves, understand the decomposition you'll maintain throughout. Every iteration fits into this shape:
+
+- **`entities.py` — the data model.** Plain, mutable Python dataclasses. One class per persistent entity: WAL records, pages, meta page. Zero I/O, zero serialization, zero validation. This is the shared vocabulary all other modules use. New iterations grow this file by adding dataclasses or fields to existing dataclasses.
+- **`codec.py` — the wire format.** Pure functions over `bytes` and dataclasses: `encode_wal_record`, `decode_wal_record`, `encode_page`, `decode_page`, `encode_meta_page`, `decode_meta_page`. Raises `DBChecksumError` on CRC failure. Never touches a file descriptor. This is where slotted-page arithmetic and struct packing live, and nothing else.
+- **`fs.py` — filesystem helpers.** Tiny module with `fsync_file(fd)` and `fsync_directory(path)`. Exists from iteration 2.
+- **Stateful services.** `wal.py`, `pager.py`, `cache.py`, `tree.py`, `db.py`. Each owns some state and delegates byte-level work to `codec.py` and file-level work to `fs.py`. Each iteration adds at most one new service module.
+- **`exceptions.py` — the error hierarchy.** Grows by one or two classes per iteration as new failure modes earn their place.
+
+**Why this matters for reading the plan.** Every iteration from 2 onward follows the same rhythm: "grow the data model, grow the codec, grow or add a service, wire it into `DB`." If you ever find yourself wanting a class that both mutates a `bytearray` in place *and* speaks on-disk format *and* is the thing the tree operates on — stop. That's three roles in one class. Split them into a dataclass, a codec function, and a service.
 
 ## How to read this plan
 
@@ -25,13 +37,9 @@ There are **no 30-minute task slices**. Each iteration is a coherent multi-day c
 
 ## What gets thrown away
 
-The only code that gets *replaced* in this plan is the **in-memory dict** that backs Iterations 1 and 2. It's deleted in Iteration 3 when the on-disk B+ tree takes over.
+The only code that gets *replaced* in this plan is the **in-memory `SortedDict`** that backs iterations 1 and 2 as the implementation of `DB.get` / `DB.put` / `DB.delete`. It is deleted in iteration 3 when the on-disk B+ tree takes over. Every other module evolves **additively**: parameters, error classes, methods, on-disk fields, and fields on dataclasses are introduced in the iteration where they earn their place.
 
-Everything else evolves **additively**: parameters, error classes, methods, on-disk fields, and modules are introduced in the iteration where they earn their place. Earlier iterations have a strict subset of the final API. Tests written in earlier iterations keep passing through later iterations because their test bodies use a `db` pytest fixture that hides the constructor signature evolution from them.
-
-The one place this isn't strictly additive is **layout-checking tests** in `test_page.py` and `test_pager.py`: when a header gains a field, the tests asserting "byte at offset N is field X" have to be updated.
-
-Throwaway count: **one Python module** (`_inmem.py`), introduced as a deliberate stepping-stone so you have something to put behind the API while you build the WAL.
+Tests written in earlier iterations keep passing through later iterations because their test bodies use a `db` pytest fixture that hides the constructor signature evolution. The only tests that ever get *edited* (rather than added to) are layout-checking tests that assert "byte at offset N is field X" — when a header gains a field, those assertions must follow it.
 
 ## Earn-your-place principle
 
@@ -39,20 +47,27 @@ Every parameter, every exception class, every method, every field exists in the 
 
 | Concept | Earned in |
 |---|---|
-| `DB()` constructor + context manager (no args) | Iter 1 |
-| `put` / `get` / `delete` / `scan` / `close` / context manager | Iter 1 |
+| `DB()` constructor + context manager | Iter 1 |
+| `put` / `get` / `delete` / `scan` / `close` | Iter 1 |
 | `DBClosedError` | Iter 1 |
 | Type checks (`bytes` only) → built-in `TypeError` | Iter 1 |
-| `dir_path` parameter | Iter 2 |
-| `DBCorruptError` | Iter 2 |
-| `page_size_bytes` parameter | Iter 3 |
+| `data_dir` constructor parameter | Iter 2 |
+| `entities.py` (WAL record dataclasses) | Iter 2 |
+| `codec.py` (WAL record encode/decode) | Iter 2 |
+| `wal.py` + `fs.py` | Iter 2 |
+| `DBCorruptedError`, `DBChecksumError` | Iter 2 |
+| Page dataclasses in `entities.py` | Iter 3 |
+| Page codec functions in `codec.py` | Iter 3 |
+| `pager.py`, `tree.py` | Iter 3 |
+| `page_size_bytes` constructor parameter | Iter 3 |
 | `DBRecordTooLargeError` and the size limit | Iter 3 |
-| `DBConcurrentModificationError` and `_version_counter` | Iter 3 |
-| `last_modified_lsn` page-header field | Iter 4 |
-| `cache_capacity_pages` parameter | Iter 4 |
-| `checkpoint()` method, `last_checkpoint_lsn` meta field | Iter 5 |
+| `DBConcurrentPageModificationError` and the version counter | Iter 3 |
+| `last_modified_lsn` field on page dataclasses | Iter 4 |
+| `cache.py`, `cache_capacity_pages` constructor parameter | Iter 4 |
+| `checkpoint()` method, `last_checkpoint_lsn` on `MetaPage` | Iter 5 |
+| `WALCheckpointRecord` | Iter 5 |
 | `checkpoint_wal_size_bytes`, `checkpoint_dirty_page_ratio` | Iter 5 |
-| `freelist_head` meta field, freelist page type | Iter 6 |
+| `FreelistPage` dataclass, `freelist_head` on `MetaPage` | Iter 6 |
 
 If you ever find yourself adding something the current iteration doesn't justify, stop and ask "what would feel wrong without it?" If the answer is "nothing yet," defer it.
 
@@ -70,21 +85,35 @@ Because the API is the contract. Every later iteration is a *re-implementation* 
 
 ### What you build
 
-A package skeleton with `uv`, `ruff`, `ty`, `pytest`. The `src/bptreedb/` layout with these modules:
+A package skeleton with `uv`, `ruff`, `ty`, `pytest`, `sortedcontainers`, and `hypothesis`. The `src/bptreedb/` layout with these modules:
 
-- `errors.py` — `DBError(Exception)` as the base class, plus one subclass: `DBClosedError`. Re-export from `__init__.py`. (`DBConcurrentModificationError` is deferred to Iteration 3, where the on-disk tree's lazy iterator makes mid-scan mutation actually unsafe.)
-- `db.py` — the `DB` class.
-- `_inmem.py` — a tiny in-memory backing store. Use `sortedcontainers.SortedDict` (add `sortedcontainers` to dependencies) or a plain `dict` with sorted iteration. The whole module is maybe 30 lines.
+- `exceptions.py` — the error hierarchy. Only two classes this iteration:
 
-The `DB` class:
+  ```
+  DBError(Exception)
+  └── DBClosedError(DBError)
+  ```
 
-- `DB()` — no arguments. Constructs a fresh `DB` instance. Used as a context manager: `with DB() as db: ...`. Entering the context performs the open work; exiting calls `close()`. Manual `db.open()` and `db.close()` methods are also exposed for callers who don't want to use a `with`-statement.
-- `put(key, value)` — raises `TypeError` if either argument is not `bytes`. Otherwise inserts into the in-memory dict.
-- `get(key)` — looks up in the in-memory dict; returns the value or `None`.
-- `delete(key)` — removes from the in-memory dict; returns `True` if it was present, `False` otherwise.
-- `scan(start_key_inclusive, end_key_exclusive)` — returns a generator yielding `(key, value)` pairs in sorted order over the half-open range. Both bounds are required (no defaults) — callers must be explicit about the scan range, and pass `None` for an unbounded side. **The behaviour of mutating the DB while a scan is in flight is undefined in this iteration; it will become a `DBConcurrentModificationError` in Iteration 3.** Document this in the method's docstring so callers don't accidentally rely on the underlying `SortedDict`'s behaviour.
-- `close()` — sets a `_closed` flag; subsequent calls to any other public method raise `DBClosedError`.
-- `__enter__` / `__exit__` — context manager support; `__exit__` calls `close()`.
+  Re-export both from `__init__.py`.
+
+- `db.py` — the `DB` class, which internally stores key/value pairs in a `SortedDict` (from `sortedcontainers`). No separate backing-store module is needed — a `SortedDict` attribute is fine, and you'll rip it out wholesale in iteration 3 anyway.
+
+**`DB` class, iteration 1 surface.**
+
+| name | kind | signature | behaviour |
+|---|---|---|---|
+| `__init__` | method | `DB() -> None` | No arguments. Initialize an internal `SortedDict`, an `is_opened = False` flag. |
+| `open` | method | `open() -> None` | Flip `is_opened = True`. Idempotent: calling twice is fine. Exists so callers who don't use `with` can still use the DB. |
+| `close` | method | `close() -> None` | Clear the `SortedDict`, flip `is_opened = False`. |
+| `__enter__` / `__exit__` | methods | context manager | `__enter__` calls `open()` and returns `self`; `__exit__` calls `close()` and does not suppress exceptions. |
+| `put` | method | `put(key: bytes, value: bytes) -> None` | Raises `DBClosedError` if not opened. Raises `TypeError` if either argument is not `bytes`. Otherwise inserts into the `SortedDict`. |
+| `get` | method | `get(key: bytes) -> bytes \| None` | Raises `DBClosedError` if not opened. Raises `TypeError` if `key` is not `bytes`. Returns the value or `None`. |
+| `delete` | method | `delete(key: bytes) -> bool` | Raises `DBClosedError` if not opened. Raises `TypeError` if `key` is not `bytes`. Returns `True` if a key was removed, `False` if it was already absent. |
+| `scan` | method | `scan(start_key_inclusive: bytes \| None, end_key_exclusive: bytes \| None) -> Iterator[tuple[bytes, bytes]]` | Raises `DBClosedError` / `TypeError` eagerly (validate *before* entering the generator body, otherwise bad arguments wouldn't surface until the first `next()`). Yields `(key, value)` pairs in ascending key order over the half-open range `[start, end)`. Both bounds are required arguments; pass `None` for an unbounded side. |
+
+**Implementation note on eager validation in `scan`.** A function containing a `yield` becomes a generator, which means its body doesn't run until `next()` is first called. If you want `scan` to raise immediately on a closed DB or a non-`bytes` argument, split it into a public `scan` method that does the checks and then `return self._scan(...)`, and a private `_scan` generator method that does the yielding.
+
+**Mutation during scan is undefined in iteration 1.** Document this in the docstring. Iteration 3 will turn it into a real `DBConcurrentPageModificationError` once `scan` becomes a lazy iterator over actual on-disk pages.
 
 ### Tests that earn the milestone
 
@@ -150,61 +179,154 @@ Because in Iteration 1 you have no durability at all. Before you build any compl
 
 ### What you build
 
-**The constructor signature changes for the first time.** `DB()` becomes `DB(dir_path)` — `dir_path` is required because the API now has a place to persist things to. Update the `db` fixture in `tests/conftest.py` to take `tmp_path` and call `DB(tmp_path)`. Update the two or three tests that constructed `DB()` directly. Every other test body is unchanged.
+**Four new modules appear, in this dependency order:** `fs.py` (filesystem helpers), `entities.py` (data model dataclasses), `codec.py` (wire-format encode/decode), `wal.py` (the stateful WAL service). The `DB` constructor changes for the first time.
 
-**A new exception is earned.** `DBCorruptError` is added to `errors.py` and re-exported from `__init__.py`. It is raised when a WAL CRC check fails *somewhere other than the torn tail* — i.e., a record fails its CRC check but is followed by a record that passes. A torn tail at the end of the file is silently truncated (the user was never told about anything beyond the last fsync); a CRC failure followed by valid records is genuine corruption and we raise.
-
-We deliberately do **not** police the contents of `dir_path`. If the directory contains files we don't recognise, that's the user's business — foreign files don't corrupt the DB, and refusing to open in their presence would just be officious. The DB only owns the files it created.
-
-A new module:
-
-- `wal.py` — the WAL writer and replayer. Constructor takes `dir_path` and creates `<dir_path>/wal.log` if it doesn't exist. (We'll create the directory itself here too — Iteration 1 never had to.)
-
-A WAL record is framed as:
+**Two new exceptions are earned.** Add to `exceptions.py`:
 
 ```
-4 bytes  record_length        uint32, length of everything after this field
-8 bytes  lsn                  uint64
-1 byte   op_type              0x01 PUT, 0x02 DELETE
-... payload ...
-4 bytes  crc32                CRC of record_length + lsn + op_type + payload
+DBError(Exception)
+├── DBClosedError
+└── DBCorruptedError
+    └── DBChecksumError(expected: int, actual: int)
 ```
 
-PUT payload: `key_length(4) | key | value_length(4) | value`
-DELETE payload: `key_length(4) | key`
+`DBCorruptedError` is raised when the WAL contains *genuine* corruption — e.g., a CRC failure followed by one or more valid records. `DBChecksumError` is raised by the codec on any CRC mismatch and is caught and re-raised (or swallowed, in the torn-tail case) by the WAL service. A torn tail at the very end of the log is silently truncated; the user was never told about anything beyond the last fsync.
 
-Note we are **not** introducing the CHECKPOINT op type yet. There is no checkpoint. The WAL is the database.
+**We deliberately do not police the contents of the data directory.** If the directory contains files we don't recognise, that's the user's business. The DB only owns the files it created.
 
-The `WAL` class exposes:
+#### `fs.py`
 
-- `append_put(key, value) -> int` — encodes, writes, returns the LSN it used.
-- `append_delete(key) -> int` — same for delete.
-- `fsync() -> None` — flushes the file and calls `os.fsync` on the descriptor.
-- `replay() -> Iterator[Record]` — walks the file from the start, validating each record's CRC and verifying that LSNs are strictly increasing. Stops at the first record that fails any check (the **torn tail**) and truncates the file to the end of the last good record.
+Two tiny helpers:
 
-Why each piece exists, justified now:
+```python
+def fsync_file(fd: IO) -> None
+def fsync_directory(path: str | os.PathLike) -> None
+```
 
-- **`record_length`** — so the replayer knows how many bytes to read for each record without parsing the payload.
-- **`lsn`** — a monotonically increasing identifier so the replayer can detect out-of-order or missing records (which would mean torn writes or filesystem misbehaviour). It will become the load-bearing timestamp in later iterations; for now it's just a sanity check.
-- **`crc32`** — so the replayer can detect a record that was partially written (or otherwise corrupted) before its `fsync` completed. Without the CRC, you cannot distinguish a half-written torn record at the end of the log from a complete one.
-- **`fsync`** — without it, "the OS has buffered your write" is *not* the same as "your write is on disk." A power loss or kernel panic between `write` and `fsync` loses everything in the OS buffer. Calling `fsync` before returning from `put` is the *only* thing that lets you tell the user "your write is durable."
+`fsync_directory` should silently no-op on platforms that don't support it (Windows, some network filesystems).
 
-In `db.py`, modify the `DB` open path, `DB.put`, and `DB.delete`:
+#### `entities.py` — the data model for WAL records
 
-- `DB(dir_path)` stores the path; the actual open work happens in `__enter__` (or in an explicit `db.open()` method that `__enter__` delegates to). Opening creates the directory if it doesn't exist. Then instantiates a `WAL` and immediately calls `wal.replay()` on it, applying each record to the in-memory dict. The dict is now seeded with the prior history. (No foreign-file check — see the note above on why we don't police directory contents.)
-- `put` calls `wal.append_put(key, value)` and `wal.fsync()` *before* it touches the in-memory dict. This is the discipline of write-ahead logging: you log the change before you make the change.
-- `delete` does the symmetric thing.
-- `close` calls `wal.fsync()` once more (in case anything was buffered) and closes the WAL file.
+Plain dataclasses. No methods:
 
-Also, **the `_file_factory` test hook**. Add a private `_file_factory` parameter to `WAL.__init__` (and thread it through `DB.__init__` as a private parameter `_file_factory`, undocumented in the public API). It defaults to `open(...)`. Tests will use it to inject a `FaultyFile`. Yes, this is a private wart on the public class — that's the price of property-based crash testing without monkey-patching.
+```python
+@dataclass
+class WALRecord:
+    lsn: int
 
-The `FaultyFile` test fixture lives in `tests/conftest.py` (or `tests/crash/conftest.py`):
+@dataclass
+class WALPutRecord(WALRecord):
+    key: bytes
+    value: bytes
 
-- Wraps a real file. Every `write` is recorded in an "unfsynced" buffer in addition to going to the file.
-- `fsync` clears the unfsynced buffer and snapshots the file's current contents.
-- `crash()` reverts the file on disk to the last snapshot.
+@dataclass
+class WALDeleteRecord(WALRecord):
+    key: bytes
+```
 
-The fixture exposes a `file_factory` callable that produces `FaultyFile` instances and a `crash_all(...)` helper that crashes every file in the DB.
+These are the *only* structured values that cross the WAL / DB boundary. The DB hands a `WALPutRecord` to the WAL on `put`; the WAL hands `WALRecord` subclasses back to the DB during `replay`.
+
+#### `codec.py` — the wire-format codec
+
+A WAL record on disk is framed as:
+
+```
+4 bytes  record_length       uint32 (length of everything after this field, including the CRC)
+8 bytes  lsn                 uint64
+1 byte   op_type             uint8 (0x01 PUT, 0x02 DELETE)
+... op-specific payload ...
+4 bytes  crc32               uint32 (over record_length + lsn + op_type + payload)
+```
+
+- PUT payload: `key_length(4) | key | value_length(4) | value`
+- DELETE payload: `key_length(4) | key`
+
+All integers are little-endian unsigned. (We are **not** introducing the CHECKPOINT op type yet; there is no checkpoint.)
+
+Why each piece exists:
+
+- **`record_length`** — so the replayer knows how many bytes to read without parsing the payload.
+- **`lsn`** — a monotonically increasing identifier so the replayer can detect out-of-order records. It becomes the load-bearing timestamp in later iterations; today it's a sanity check.
+- **`crc32`** — so the replayer can detect a torn record at the end of the log. Without the CRC, a half-written record is indistinguishable from a complete one.
+
+Introduce small reader/writer helpers so the codec stays legible:
+
+```python
+class BufferReader:
+    def __init__(data: bytes) -> None
+    def read_struct(spec: str | Struct) -> tuple
+    def read_bytes(length: int) -> bytes
+    def read_length_prefixed_bytes() -> bytes
+
+class BufferWriter:
+    def write_struct(spec: str | Struct, *values) -> None
+    def write_bytes(value: bytes) -> None
+    def write_length_prefixed_bytes(value: bytes) -> None
+    def crc32() -> int
+    def build() -> bytes
+```
+
+And the WAL-record codec functions:
+
+```python
+def verify_crc32(data: bytes) -> None
+    # Raises DBChecksumError on mismatch. Reads the trailing 4 bytes as the
+    # expected CRC and checks against the CRC of everything before them.
+
+def encode_wal_record(record: WALRecord) -> bytes
+    # Dispatches on the concrete class (WALPutRecord / WALDeleteRecord),
+    # writes length + lsn + op_type + payload + crc, returns the full frame.
+
+def decode_wal_record(data: bytes) -> WALRecord
+    # Calls verify_crc32 first, then parses lsn, op_type, and the payload.
+
+def decode_next_wal_record_from_file(fd: IO[bytes]) -> WALRecord
+    # Reads the 4-byte length field from the file, reads the rest of the
+    # frame by that length, and delegates to decode_wal_record. Raises
+    # EOFError at end of file or on a short read (which is how torn tails
+    # manifest).
+```
+
+The codec is **pure** — it never touches a file descriptor except for the one convenience wrapper that reads framed records off a file handle so the WAL service doesn't have to duplicate length-prefix logic.
+
+#### `wal.py` — the stateful WAL service
+
+One class, `WAL`, that owns the log file.
+
+**`WAL` class.**
+
+| name | kind | signature | behaviour |
+|---|---|---|---|
+| `__init__` | method | `WAL(path: Path) -> None` | Store the path. Do not touch the filesystem. |
+| `path` | attribute | `Path` | The log file path. |
+| `current_lsn` | attribute | `int` | LSN of the most recently appended record; 0 if empty. |
+| `open` | method | `open() -> None` | Open the log file in append mode (`"a+b"`). If the file did not already exist, `fs.fsync_directory` on the parent to make the file creation durable. Idempotent: calling twice is a no-op. |
+| `close` | method | `close() -> None` | Fsync, close the file descriptor, drop it. |
+| `__enter__` / `__exit__` | methods | context manager | Wrap `open` / `close`. |
+| `append_put` | method | `append_put(key: bytes, value: bytes) -> int` | Build a `WALPutRecord` with `lsn = current_lsn + 1`, encode it, write to the file, fsync, bump `current_lsn`, return the LSN. |
+| `append_delete` | method | `append_delete(key: bytes) -> int` | Same, for `WALDeleteRecord`. |
+| `replay` | method | `replay(callback: Callable[[WALRecord], None]) -> None` | Walk the file from the start, decoding one record at a time. On each successful record: check that its LSN equals the previous good LSN + 1 (sequential invariant), and call `callback(record)`. On a `DBChecksumError`, set a "saw-a-broken-record" flag and keep reading. If we later see *another* successful record after a broken one, raise `DBCorruptedError` — that's genuine corruption, not a torn tail. On `EOFError`, stop. Finally, truncate the file to the end of the last good record and fsync. |
+
+Why the sequential-LSN check belongs in `replay` and not in the codec: the codec deals with *one* record at a time and can't know what came before. The WAL service holds the "previous good LSN" as loop state.
+
+**Modifications to `DB`:**
+
+- `DB(data_dir: str | Path)` — `data_dir` is required. The `is_opened` flag stays. Instantiate a `WAL` at `data_dir / "bptreedb.wal"` in `__init__`. Do not open it yet.
+- `open()` — create `data_dir` if it doesn't exist (and fsync its parent via `fs.fsync_directory` if we created it). Then `wal.open()`, then `wal.replay(self._apply_wal_record)` to seed the in-memory `SortedDict` from history. Flip `is_opened = True`. If replay raises, close the WAL and re-raise.
+- `_apply_wal_record(record)` — dispatch on type: `WALPutRecord` → `self.data[record.key] = record.value`; `WALDeleteRecord` → `self.data.pop(record.key, None)`. This is the shared in-memory application logic used by both replay and live operations. Crucially, **replay must not bump any version counter** (there is no counter yet, but iteration 3 will add one, and you will come back and carefully avoid bumping it from here).
+- `put(key, value)` — `wal.append_put(key, value)` *first*, then `self.data[key] = value`. This is the discipline of write-ahead logging: log the change before making the change. The fsync happens inside `append_put`.
+- `delete(key)` — in iteration 1 you unconditionally set a flag. Now, only log if the key is actually present (otherwise you pollute the log with no-ops). Check `key in self.data` first; if present, `wal.append_delete(key)`, then `del self.data[key]`, return `True`; otherwise return `False`.
+- `close()` — `wal.close()`, clear the dict, flip `is_opened = False`.
+
+Update the `db` pytest fixture to take `tmp_path` and instantiate `DB(tmp_path)`. Update the handful of tests that construct `DB()` directly.
+
+#### The `FaultyFile` crash-test fixture
+
+Lives in `tests/conftest.py` (or `tests/crash/conftest.py`). Wraps a real file. Every `write` goes to the file AND to an "unfsynced" buffer. `fsync` clears the unfsynced buffer and snapshots the current file contents. `crash()` reverts the on-disk file to the last snapshot.
+
+To let tests inject `FaultyFile`, thread a private `_file_factory` parameter through `WAL.__init__` and (transitively) `DB.__init__`. It defaults to the built-in `open`. Yes, this is a private wart on the constructor — it's the price of property-based crash testing without monkey-patching, and it's well worth it.
+
+The fixture exposes a `file_factory` callable that produces `FaultyFile` instances and a `crash_all(...)` helper that crashes every faulty file in the DB.
 
 ### Tests that earn the milestone
 
@@ -260,188 +382,306 @@ Both flaws have the same root cause: the WAL is the *only* place the data lives 
 
 ### Goal
 
-Replace the in-memory dict with a paged file containing a B+ tree. The dataset is no longer bounded by RAM. The WAL stays exactly as it is — its records still describe logical operations and its replay still rebuilds the dataset from the log — but now "the dataset" lives in a file, and replay rebuilds *it* instead of the in-memory dict.
+Replace the in-memory `SortedDict` with a paged file containing a B+ tree. The dataset is no longer bounded by RAM. The WAL stays exactly as it is — its records still describe logical operations and its replay still rebuilds the dataset from the log — but now "the dataset" lives in a file, and replay rebuilds *it* instead of an in-memory dict.
 
 ### Why now
 
-This is the iteration where the database stops being a dict-with-a-log and starts being a database. It's the largest and most interesting iteration. You will build the slotted page format, the pager, and the tree algorithms; you will throw away `_inmem.py`; and at the end every existing test will still pass *unchanged*, because the public API is the contract.
+This is the iteration where the database stops being a dict-with-a-log and starts being a database. It's the largest and most interesting iteration. You will introduce page dataclasses in `entities.py`, page codec functions in `codec.py`, and two new service modules (`pager.py`, `tree.py`); you will throw away the `SortedDict`; and at the end every existing iteration 1 / iteration 2 test will still pass *unchanged*, because the public API is the contract.
 
 **Three new things on the API surface earn their place here:**
 
-1. **`page_size_bytes` parameter on the `DB` constructor.** Now that the database has pages, the page size is a real configurable. Default 4096; honoured only on creation (an existing DB uses its stored page size). Update the `db` fixture in `tests/conftest.py` to pass `page_size_bytes=256` so that splits and merges happen often in tests.
-2. **`DBRecordTooLargeError`.** Now that there's a maximum record size (`(page_size_bytes - HEADER_SIZE) // 4 - SLOT_SIZE`), `put` enforces it. The error class is added to `errors.py` and re-exported.
-3. **`DBConcurrentModificationError` and `_version_counter`.** Now that `scan` returns a *real* lazy iterator that walks leaf pages via `right_sibling`, mutating the tree mid-scan is genuinely unsafe — a `put` between two `next()` calls can split the leaf the iterator is sitting on, move records, and rewrite sibling pointers. The iterator's "I am at slot N of leaf page P" state stops being meaningful. The version counter is the cheap, honest fix: the iterator snapshots a counter at construction and re-checks it on every `next()`. The error class is added to `errors.py` and re-exported.
+1. **`page_size_bytes` parameter on the `DB` constructor.** Default 4096; honoured only on creation (an existing DB uses the page size stored in its meta page). Update the `db` pytest fixture to pass `page_size_bytes=256` so that splits and merges happen often in tests.
+2. **`DBRecordTooLargeError`.** Now that there's a maximum record size, `put` enforces it. Added to `exceptions.py` and re-exported.
+3. **`DBConcurrentPageModificationError` and the version counter.** Now that `scan` returns a *real* lazy iterator that walks leaf pages via `right_sibling_page_id`, mutating the tree mid-scan is genuinely unsafe — a `put` between two `next()` calls can split the leaf the iterator is sitting on, move records, and rewrite sibling pointers. The iterator's "I am at slot N of leaf page P" state stops being meaningful. The version counter is the cheap, honest fix: the iterator snapshots the counter at construction and re-checks it on every `next()`.
 
-   Implementation details:
+   **Rules for the version counter** (owned by `DB`, not by the tree):
 
    - `DB.__init__` adds `self._version_counter = 0`.
    - `DB.put` bumps the counter at the end of every successful insert.
-   - `DB.delete` bumps the counter only when the key was actually present (return value `True`). A failed `delete` is not a mutation and must not invalidate live iterators.
+   - `DB.delete` bumps the counter only when the key was actually present. A failed `delete` is not a mutation and must not invalidate live iterators.
    - `DB.get` does NOT bump the counter — search is not a mutation.
-   - `DB.scan` snapshots `self._version_counter` at the top, then checks it at the top of each loop iteration before yielding. The check belongs at the top of the loop body, which is the code that runs *after* the consumer's `next()` resumes the generator and *before* the next value is produced.
-   - The check fires on the *first* `next()` too, so a mutation between iterator construction and the first `next()` raises.
-   - `_replay_wal` must NOT go through `put` / `delete` (which would bump the counter). Apply records to the tree directly inside the replay loop and leave the counter alone.
+   - `DB.scan` snapshots `self._version_counter` at the top, then checks it at the top of each loop iteration *before* yielding. The check belongs at the top of the loop body, which is the code that runs after the consumer's `next()` resumes the generator and before the next value is produced. This guarantees the check fires on the *first* `next()` too, so a mutation between iterator construction and the first `next()` raises.
+   - `_apply_wal_record` (called from recovery) must NOT go through `put` / `delete` — that would bump the counter during replay. Keep it calling tree operations directly.
+   - On the failure path (e.g., a `TypeError` from `put` on a non-`bytes` argument), the counter must NOT bump. Only successful mutations count.
 
-I am going to walk you through this iteration in three sub-steps. Each sub-step is its own pass through the code with its own commit. The order matters: the page codec is purely functional and easy to test, the pager builds on it, and the tree builds on the pager. **Within each sub-step, I will introduce only the on-disk fields you need at this iteration.** Fields like `last_modified_lsn`, `last_checkpoint_lsn`, and `freelist_head` will *not* exist after this iteration — they get added in Iterations 4, 5, and 6, when the iterations themselves explain why they have to.
+This iteration proceeds in four sub-steps. Each is its own pass through the code, with its own commit. The order matters: data model first (pure data, trivial to test), codec next (pure functions over the data model, trivial to round-trip test), then pager (stateful wrapper around the codec and a file), then tree (algorithms operating on the dataclasses via the pager).
 
-### Sub-step 3a: The slotted page codec
+### Sub-step 3a: Grow the data model and the codec for pages
 
-A new module: `page.py`. A new test file: `tests/unit/test_page.py`.
+No new service modules yet. You are just adding dataclasses to `entities.py` and pure functions to `codec.py`.
 
-A page is a fixed-size `bytes` (or `bytearray`) buffer. Every page starts with a header. Internal nodes and leaves use the same header layout, distinguished by a type tag. The layout is:
+#### Add to `entities.py`
 
-| offset | size | field              | why it exists at this iteration                                              |
-|-------:|-----:|--------------------|------------------------------------------------------------------------------|
-|      0 |    1 | `type_tag`         | Internal vs leaf nodes have different record formats; the parser must know which it's looking at. |
-|      1 |    3 | reserved           | Alignment padding so the next field starts at a 4-byte boundary.             |
-|      4 |    4 | `num_slots`        | The slot directory grows downward as records are added; you need to know its current length. |
-|      8 |    4 | `free_space_start` | The end of the slot directory; an insert needs to know where the next slot pointer goes. |
-|     12 |    4 | `free_space_end`   | The start of the records region; an insert needs to know where the next record bytes go. |
-|     16 |    8 | `right_sibling`    | Leaves only: `scan` walks the leaf chain forward via this pointer. Internal nodes overload this slot to hold their leftmost child pointer (so the slot directory only contains "key + child" pairs and doesn't need a special "slot −1"). |
+```python
+@dataclass
+class MetaPage:
+    magic: bytes              # always b"BPTREEDB"
+    version: int              # currently 1
+    page_size_bytes: int
+    root_page_id: int
+    next_page_id: int
 
-Total: 24 bytes. **Yes, 24, not 32.** You don't have `last_modified_lsn` yet — there's no buffer pool to need it. The header will gain bytes in Iteration 4. Today it's 24.
+@dataclass
+class LeafSlot:
+    key: bytes
+    value: bytes
 
-After the header, the slot directory grows downward (each slot is `record_offset(4) + record_length(4) = 8` bytes). After the slot directory, free space. From the end of the page, records grow upward.
+@dataclass
+class InternalSlot:
+    key: bytes
+    child_page_id: int
 
-**Leaf record:** `key_length(4) | key | value_length(4) | value`.
-**Internal record:** `key_length(4) | key | child_page_id(8)`.
+@dataclass
+class LeafPage:
+    right_sibling_page_id: int                 # page id of the next leaf in key order; 0 if rightmost
+    slots: list[LeafSlot]
 
-The maximum usable record size is `(page_size_bytes - 24) // 4 - 8`. Compute it as a function so the value isn't magic; you'll use it both in `put`'s size check and in split decisions.
+@dataclass
+class InternalPage:
+    leftmost_child_page_id: int                # the "slot -1" pointer
+    slots: list[InternalSlot]
+```
 
-The `SlottedPage` class wraps a `bytearray` and exposes:
+These dataclasses carry **only** the fields the tree directly needs. Fields like `num_slots`, `free_space_start`, `free_space_end` are *wire-format bookkeeping* — the codec computes them on encode and discards them on decode. They do not belong on the dataclass.
 
-- Construction of an empty page given `(page_size_bytes, type_tag)`.
-- `from_bytes(buf)` and `to_bytes()` for round-tripping.
-- `num_slots`, `free_bytes`, `total_record_bytes` as read-only properties.
-- `insert_slot(slot_index, payload)`, `get_slot_payload(slot_index)`, `delete_slot(slot_index)` operating on opaque payload bytes.
-- `compact()` — repacks live records contiguously to reclaim garbage left by deleted slots. The codec needs this because deletes leave holes in the records region; compaction is called when an insert can't find a contiguous run despite enough total free bytes.
-- `insert_leaf(slot_index, key, value)` and `get_leaf(slot_index)` as the leaf-typed convenience layer.
-- `insert_internal(slot_index, key, child_page_id)` and `get_internal(slot_index)` as the internal-typed convenience layer.
-- `find_slot_for_key(key) -> (insertion_index, exact_match)` — binary search.
-- `iter_keys()`, `iter_leaf_items()`, `iter_internal_items()`.
+Iteration 4 will add `last_modified_lsn` to `LeafPage` and `InternalPage`. Iteration 5 will add `last_checkpoint_lsn` to `MetaPage`. Iteration 6 will add `freelist_head` to `MetaPage` and a `FreelistPage` dataclass. Today, the fields above are all you need.
 
-**Tests for `test_page.py`:**
+#### On-disk layouts (what the codec reads and writes)
 
-- Header round-trip.
-- Empty page invariants (`num_slots == 0`, `free_bytes == page_size_bytes - 24`).
-- Insert at index 0, end, middle; verify all surviving payloads readable in order.
-- Out-of-space insert raises and leaves the page unchanged.
-- Delete shifts slot pointers and reduces `num_slots`.
-- After several deletes, `compact()` reclaims the garbage and `to_bytes`/`from_bytes` round-trips.
-- Leaf and internal record round-trip helpers.
-- Binary search returns the correct `(insertion_index, exact_match)` for keys present, between, before all, after all.
-- Inserting in random order via `find_slot_for_key` produces a sorted page.
+All multi-byte integers are little-endian unsigned.
 
-Suggested commit: `feat(page): slotted page codec with leaf and internal records`.
+**Meta page (page 0), 36 bytes + zero padding to `page_size_bytes`:**
+
+| offset | size | field             |
+|-------:|-----:|-------------------|
+|      0 |    8 | `magic` (`b"BPTREEDB"`) |
+|      8 |    4 | `version`         |
+|     12 |    4 | `page_size_bytes` |
+|     16 |    8 | `root_page_id`    |
+|     24 |    8 | `next_page_id`    |
+|     32 |    4 | `crc32` (over bytes 0..32) |
+
+**Slotted page header (internal & leaf), 24 bytes:**
+
+| offset | size | field              |
+|-------:|-----:|--------------------|
+|      0 |    1 | `type_tag` (0x01 internal, 0x02 leaf) |
+|      1 |    3 | reserved (zero, for alignment) |
+|      4 |    4 | `num_slots`        |
+|      8 |    4 | `free_space_start` (offset just past the last slot entry) |
+|     12 |    4 | `free_space_end`   (offset of the first byte of the lowest record) |
+|     16 |    8 | `right_sibling_page_id`    (leaves: next-leaf page id or 0; internal nodes: `leftmost_child_page_id`) |
+
+The `right_sibling_page_id` slot is overloaded by node type: in a leaf it is the forward pointer used by `scan`; in an internal node it stores the leftmost child pointer. This overload keeps the header a single fixed shape and avoids a special "slot -1" case.
+
+After the 24-byte header comes the slot directory growing downward from offset 24, with each slot entry being 8 bytes: `record_offset(4) | record_length(4)`. After the slot directory is free space. From the end of the page, records grow upward toward the slot directory.
+
+**Leaf record body:** `key_length(4) | key | value_length(4) | value`
+**Internal record body:** `key_length(4) | key | child_page_id(8)`
+
+**Size limit.** The maximum encoded record body is `(page_size_bytes - 24) // 4 - 8` bytes. For `page_size_bytes = 4096` this is 1008 bytes; for 256 it is 48 bytes. The `/4` guarantees at least four records fit in an empty page, which keeps the half-full invariant achievable. Expose this as a function `max_record_body_size(page_size_bytes) -> int` in `codec.py` so the tree can call it from both the size check in `put` and the split decision.
+
+#### Add to `codec.py`
+
+Pure functions, plus a helper:
+
+```python
+def max_record_body_size(page_size_bytes: int) -> int
+
+def encode_meta_page(meta: MetaPage, page_size_bytes: int) -> bytes
+    # Packs magic, version, page_size_bytes, root_page_id, next_page_id,
+    # appends crc32, and zero-pads to page_size_bytes.
+
+def decode_meta_page(buf: bytes) -> MetaPage
+    # Verifies magic and CRC. Raises DBCorruptedError on magic mismatch.
+    # Raises DBChecksumError on CRC mismatch (which is a DBCorruptedError).
+
+def encode_page(page: LeafPage | InternalPage, page_size_bytes: int) -> bytes
+    # Walks page.slots, packs record bodies from the end of the buffer growing
+    # upward, packs slot entries from offset 24 growing downward, writes the
+    # header with computed num_slots / free_space_start / free_space_end /
+    # right_sibling_page_id (or leftmost_child_page_id). The output is exactly page_size_bytes.
+    # Raises DBRecordTooLargeError if any single record body exceeds
+    # max_record_body_size(page_size_bytes).
+    # Raises ValueError if the encoded result would overflow page_size_bytes
+    # (this indicates a tree-level bug — the tree should have split before
+    # asking the codec to encode an oversized page).
+
+def decode_page(buf: bytes) -> LeafPage | InternalPage
+    # Reads the header, dispatches on type_tag, walks the slot directory to
+    # reconstruct the slots list. No CRC — slotted pages are protected by
+    # the WAL, not by per-page checksums.
+```
+
+Because the codec re-packs from scratch on every `encode_page`, there is no in-memory "compaction" step. Deletions simply `slots.pop(i)`; the next encode produces a tight page with no holes. This is a deliberate simplification — you're trading per-encode CPU (fine in Python) for a *lot* of algorithmic simplicity compared to an in-place byte-buffer design.
+
+#### Tests (`tests/unit/test_codec.py`, growing the file from iteration 2)
+
+- `encode_meta_page` → `decode_meta_page` round-trips.
+- Tampered meta page CRC raises `DBChecksumError`.
+- Wrong magic raises `DBCorruptedError`.
+- `encode_page(LeafPage(...))` → `decode_page` round-trips. Verify `slots` list matches.
+- Same for `InternalPage`.
+- `encode_page` of an empty leaf / empty internal page round-trips.
+- `encode_page` with a record body exceeding `max_record_body_size` raises `DBRecordTooLargeError`.
+- Property test: generate random `LeafPage` instances with valid record bodies, round-trip, assert equality.
+
+Suggested commit: `feat(codec): slotted page and meta page encode/decode`.
 
 ### Sub-step 3b: The pager
 
 A new module: `pager.py`. A new test file: `tests/unit/test_pager.py`.
 
-The pager owns the data file `data.db` inside `dir_path`. It is the only thing that touches the file. (The WAL, from Iteration 2, is still its own thing, owning `wal.log` independently.)
+The pager owns the file `<data_dir>/bptreedb.data`. It is the only thing that touches the file. The WAL (from iteration 2) is still its own thing, owning `bptreedb.wal` independently.
 
-The data file is `N * page_size_bytes` bytes. Page 0 is the **meta page** with this layout:
+The data file is `N * page_size_bytes` bytes for some `N ≥ 2`: page 0 is the meta page, page 1 is the initial empty root leaf. The pager **reads and writes raw page-sized `bytes` buffers** via `read_page` / `write_page`. For data pages it is the buffer pool (iteration 4+) or the tree (iteration 3 only) that calls `codec.encode_page` / `codec.decode_page`; for the meta page, the pager itself calls the codec because it holds the in-memory meta.
 
-| offset | size | field            | why it exists at this iteration                                                       |
-|-------:|-----:|------------------|---------------------------------------------------------------------------------------|
-|      0 |    8 | `magic`          | Identify the file format on open. Reject foreign files immediately.                   |
-|      8 |    4 | `version`        | Permit format evolution.                                                              |
-|     12 |    4 | `page_size_bytes`| Make the file self-describing — you don't have to be told the page size to open it.    |
-|     16 |    8 | `root_page_id`   | The root of the tree. Meta page is the entry point to the tree structure.             |
-|     24 |    8 | `next_page_id`   | The next page id to bump-allocate. (No freelist yet — that comes in Iteration 6.)     |
-|     32 |    4 | `crc32`          | Detect torn writes to the meta page. A bad meta page is unrecoverable from `data.db` alone, so you raise. |
+**`Pager` class, iteration 3 surface.**
 
-Total: 36 bytes. **No `last_checkpoint_lsn` yet** — there is no checkpoint. **No `freelist_head` yet** — there is no freelist.
+| name | kind | signature | behaviour |
+|---|---|---|---|
+| `__init__` | method | `Pager(path: Path, *, page_size_bytes: int, _file_factory=...) -> None` | Store the path and requested page size. No filesystem work. |
+| `path` | attribute | `Path` | Path to `bptreedb.data`. |
+| `page_size_bytes` | attribute | `int` | Honoured from the on-disk meta page after `open()` for existing databases. |
+| `num_pages` | property | `int` | Current file size divided by `page_size_bytes`. |
+| `open` | method | `open() -> None` | If the file does not exist: create it, write an initial meta page with `root_page_id=1, next_page_id=2`, bump-allocate page 1 as an empty `LeafPage(right_sibling_page_id=0, slots=[])` and write it, fsync the file, fsync the parent directory. If the file exists: read and decode the meta page (raise `DBCorruptedError` on checksum or magic failure), adopt its stored `page_size_bytes`. |
+| `close` | method | `close() -> None` | If the meta is dirty, `flush_meta()`. Then fsync and close the file. |
+| `read_page` | method | `read_page(page_id: int) -> bytes` | Seek to `page_id * page_size_bytes` and read exactly `page_size_bytes` bytes. No decoding. |
+| `write_page` | method | `write_page(page_id: int, data: bytes) -> None` | Seek to the offset and write. `len(data)` must equal `page_size_bytes`. No fsync. |
+| `fsync` | method | `fsync() -> None` | `fs.fsync_file` on the data file. |
+| `get_meta` | method | `get_meta() -> MetaPage` | Return the in-memory `MetaPage` snapshot. Callers must treat it as read-only. |
+| `update_meta` | method | `update_meta(**fields) -> None` | Mutate the in-memory `MetaPage` (e.g. `update_meta(root_page_id=17)`) and mark it dirty. Does not touch the file. |
+| `flush_meta` | method | `flush_meta() -> None` | Re-encode the in-memory meta via `codec.encode_meta_page` and write it to page 0 via `write_page`. Clear the dirty flag. Does not fsync. |
+| `allocate_page` | method | `allocate_page() -> int` | Return `meta.next_page_id` and bump it (`update_meta(next_page_id=meta.next_page_id + 1)`). Extend the file by one zero-filled page so `read_page` on the new id returns a valid buffer. (Iteration 6 will also consult the freelist first.) |
 
-The `Pager` class:
+**Two deliberate simplifications at this iteration:**
 
-- Constructor: `Pager(dir_path, *, page_size_bytes=None, _file_factory=None)`. If `data.db` doesn't exist, create it with one page (the meta page) describing an empty tree where `root_page_id` points to a freshly initialised leaf at page 1; bump-allocate that leaf and write it. If the file exists, decode and verify the meta page.
-- `read_page(page_id) -> bytes` — seek + read.
-- `write_page(page_id, data) -> None` — seek + write. No fsync.
-- `fsync() -> None` — `os.fsync` on the data file.
-- `get_meta() -> MetaPage` — return the in-memory meta.
-- `update_meta(**fields) -> None` — modify the in-memory meta. Does NOT write it to disk yet (the meta page is rewritten only on `flush_meta`).
-- `flush_meta() -> None` — re-encode the meta with a fresh CRC and write it to page 0 via `write_page`.
-- `allocate_page() -> int` — bump `meta.next_page_id` and return the prior value. Mark the meta dirty in memory. **No freelist consultation today.**
-- `close() -> None`.
+1. **There is no buffer pool yet.** `read_page` and `write_page` go to disk every time. This will be slow; you will *feel* the slowness, and that feeling is what motivates iteration 4.
+2. **`flush_meta` is called only by `close`.** The meta page hits disk at most once per DB session. Iteration 5 (checkpoints) will take over that responsibility.
 
-Two important calls about behaviour at this iteration:
+#### Tests (`tests/unit/test_pager.py`)
 
-1. **There is no buffer pool yet.** The pager reads and writes pages directly from disk on every call. This will be slow; it's fine for now. The buffer pool exists to fix this in Iteration 4, and you will be able to motivate it because you will have *felt the slowness*.
-2. **`flush_meta` is called by `close`** for now. Iteration 5 introduces checkpoints, which will become the place that calls `flush_meta` periodically. Today, the only time the meta page hits disk is at close.
-
-**Tests for `test_pager.py`:**
-
-- Create new database in a fresh directory: succeeds, creates `data.db`, page 0 decodes to a valid meta with the requested `page_size_bytes` and `root_page_id == 1`.
-- Reopen existing database: succeeds, decodes existing meta.
-- Reopen with conflicting `page_size_bytes` is silently ignored (the file's value wins).
-- Tampered meta page CRC raises `DBCorruptError`.
-- `write_page` then `read_page` round-trips.
-- `update_meta` then `get_meta` reflects the change without touching disk.
+- Fresh directory → `open()` creates `bptreedb.data` of size `2 * page_size_bytes`, meta page decodes with the requested size and `root_page_id == 1`.
+- Reopen existing database → meta decodes correctly.
+- Reopen with a conflicting `page_size_bytes` → the file's value wins silently (the constructor argument is only honoured on first creation).
+- Tampered meta page CRC → `open` raises `DBCorruptedError`.
+- `write_page` then `read_page` round-trips arbitrary bytes.
+- `update_meta` then `get_meta` reflects the change without touching the file.
 - `flush_meta` then reopen returns the updated meta.
-- `allocate_page` returns sequential ids and grows the file by one page each time.
+- `allocate_page` returns sequential ids and grows the file by one page each call.
 
 Suggested commit: `feat(pager): paged data file with meta page and bump-allocation`.
 
 ### Sub-step 3c: The B+ tree
 
-A new module: `tree.py`. A new test file: `tests/unit/test_tree.py`. Add invariant-checking helpers to a new `_debug.py`.
+A new module: `tree.py`. A new test file: `tests/unit/test_tree.py`. A new `_debug.py` with the invariant checker.
 
-The `BTree` class is given a pager and a way to read/write the root pointer (`get_root() / set_root()`). It does not know about WAL or recovery. Its only job is the algorithms.
+The `BTree` class takes a `Pager` and exposes the algorithms. It does not know about WAL or recovery; it works purely in terms of page reads, page writes, and the meta page's `root_page_id`. In iteration 3 it asks the pager directly for pages; in iteration 4 you will thread the buffer pool in instead, and most of the tree code will be unchanged because a buffer-pool `get` returns the same kind of dataclass that `codec.decode_page` returns.
 
-I am not going to repeat the algorithms in detail — they are in spec §5 with full pseudocode, and you should refer to that section as you implement. The plan here is the *order in which to bring the tree to life*.
+**`BTree` class, iteration 3 surface.**
 
-1. **`search(key)` first.** Hand-build a tiny tree of two leaves under one internal node directly via the pager (write the pages by hand into the file using the slotted-page codec from sub-step 3a). Test that `search` returns the right value for keys in each leaf, for the leaf boundaries, and for absent keys. This earns you confidence in the tree-walking and binary-search code without ever touching insert.
+| name | kind | signature | behaviour |
+|---|---|---|---|
+| `__init__` | method | `BTree(pager: Pager) -> None` | Store the pager. No other state — the root pointer lives in `pager.get_meta().root_page_id`, so there's nothing to cache here. |
+| `HALF_FULL_THRESHOLD` | class constant | `float = 0.4` | Minimum fraction of `page_size_bytes` that a non-root page must use for its encoded form after a delete. |
+| `search` | method | `search(key: bytes) -> bytes \| None` | Walk root → leaf, binary-searching each internal node. Return the value if the leaf contains the key, else `None`. |
+| `insert` | method | `insert(key: bytes, value: bytes) -> None` | Walk root → leaf, remembering the path as a stack of `(parent_page_id, child_index_in_parent)`. Insert in sorted position. If the leaf overflows, split it; propagate splits upward. Raise `DBRecordTooLargeError` if the encoded leaf-record body would exceed `codec.max_record_body_size(pager.page_size_bytes)`. |
+| `delete` | method | `delete(key: bytes) -> bool` | Walk root → leaf, remembering the path. If the key is absent, return `False`. Otherwise remove the slot. If the leaf drops below `HALF_FULL_THRESHOLD * page_size_bytes` encoded bytes, rebalance: redistribute or merge with a same-parent sibling; propagate upward; collapse the root if it is left with a single child. Return `True`. |
+| `scan` | method | `scan(start_key_inclusive: bytes \| None, end_key_exclusive: bytes \| None, version_check: Callable[[], None]) -> Iterator[tuple[bytes, bytes]]` | Find the leaf containing the start key. Walk leaves forward via `right_sibling_page_id`, yielding `(key, value)` pairs. At the top of every iteration — *before* yielding — call `version_check()`, which is the callback `DB` passes in; that callback raises `DBConcurrentPageModificationError` if the tree was mutated. Stop at the end bound or at a null `right_sibling_page_id`. |
 
-2. **`insert(key, value)` for the case where the leaf has room.** Walk to the leaf, find the sorted position, insert the slot, mark dirty (today "mark dirty" just means "you've already written it via the pager; nothing to remember"). Test by inserting many keys into a small page and `search`-ing each.
+**The version counter is owned by `DB`, not by `BTree`.** The tree takes a callback so that the check fires at the tree level without the tree needing to know about `DB`'s version field. `DB.scan` will implement the callback as something like:
 
-3. **Leaf split.** When a leaf is full, allocate a new leaf, move the upper half by *byte size* (not by count — slot directories with variable-length records must split by bytes), splice the new leaf into the right-sibling chain, compute the promoted key as the smallest key now in the new leaf. If the leaf was the root, allocate a new internal root with two children and one separator; update `root_page_id` via `set_root`.
+```python
+def scan(self, start, end):
+    self._check_if_opened()
+    ...
+    version_snapshot = self._version_counter
+    def check():
+        if self._version_counter != version_snapshot:
+            raise DBConcurrentPageModificationError()
+    return self._tree.scan(start, end, version_check=check)
+```
 
-4. **Internal split propagation.** When the parent is full, split it the same way, except the *median* separator is removed from both halves and *promoted* upward (this is the asymmetry between leaf and internal splits — leaf splits *copy* the smallest right key up; internal splits *move* the median up). Recurse all the way to the root.
+#### Bring the tree to life in this order
 
-5. **`scan(start_key_inclusive, end_key_exclusive)`.** Find the leaf containing the start key; walk forward via `right_sibling`; stop at the end. Capture and check the version counter from `DB`.
+Do not try to implement everything at once. Walk this ladder:
 
-6. **`delete(key)` without rebalance.** Find the slot, remove it. Don't worry about the half-full invariant yet.
+1. **`search(key)` first.** Hand-build a tiny two-leaf tree by calling `pager.write_page` with the output of `codec.encode_page` on freshly constructed `LeafPage` and `InternalPage` dataclasses. Test that `search` returns the right value for keys in each leaf, for the leaf boundaries, and for absent keys. This earns you confidence in the tree-walking and binary-search code without ever touching insert.
 
-7. **Same-parent merge and redistribute.** When a leaf drops below 40% by record bytes, find its same-parent left and right siblings via the parent's child list (**not** via `right_sibling`, which can cross parent boundaries; merging requires same-parent siblings). Redistribute if a sibling has spare bytes; merge otherwise. Free the merged-out page. The parent may now be under-full — recurse symmetrically.
+2. **`insert(key, value)` for the case where the leaf has room.** Walk to the leaf (remembering the path), locate the sorted position, `slots.insert(i, LeafSlot(key, value))`, `codec.encode_page` and `pager.write_page`. If the key already exists, overwrite the slot's `value`. Test by inserting many keys into a small page and `search`-ing each.
 
-8. **Internal merge propagation and root collapse.** Symmetric to insert's split propagation. Internal merges concatenate the two children plus a separator pulled down from the parent. If the root is left with one child, collapse: set `root_page_id` to that child.
+3. **Leaf split.** If `len(codec.encode_page(leaf, page_size_bytes))` would overflow the page (detect this cheaply by computing encoded-size estimates from the slot list without actually encoding, *or* by letting `encode_page` raise and handling it), split before encoding: allocate a new leaf via `pager.allocate_page`, move the upper half of `slots` by *byte size, not by count*, into the new leaf, splice the new leaf into the sibling chain (`new_leaf.right_sibling_page_id = old_leaf.right_sibling_page_id; old_leaf.right_sibling_page_id = new_leaf_id`), write both. The promoted key is the smallest key in the new leaf. If the leaf was the root, allocate a new `InternalPage` root with `leftmost_child_page_id=old_root_id` and one slot `InternalSlot(promoted_key, new_leaf_id)`, then call `pager.update_meta(root_page_id=new_root_id)`.
 
-The half-full threshold is a configurable constant in the tree module; default 0.4 (40% of page bytes).
+4. **Internal split propagation.** When the parent is also full, split it the same way — with one asymmetry: the *median* separator is removed from both halves and promoted to the grandparent. (Leaf splits *copy* the smallest right-side key up; internal splits *move* the median up.) Recurse up the path stack. If you reach the root and it splits, allocate a new root via the same pattern as step 3.
 
-The **invariant helper** in `_debug.py`:
+5. **`scan(start, end, version_check)`.** Find the leaf containing `start` via a search-style walk that stops at leaf level. Iterate slots from there, yielding while the key is below `end`. When you run off the end of a leaf, move to `right_sibling_page_id` and continue. Call `version_check()` at the top of every step of the loop, *before* yielding.
 
-`assert_tree_invariants(tree)` walks the entire tree and asserts the invariants from spec §8.6. You will use this from every property test, and from `test_tree.py` after every operation. When an invariant fails, raise an assertion error that includes a `dump_tree(tree)` text rendering so the failure message is debuggable.
+6. **`delete(key)` without rebalance.** Locate the slot, `slots.pop(i)`, encode, write. Return `True`. Don't worry about the half-full invariant yet.
 
-**Tests for `test_tree.py`:**
+7. **Same-parent merge and redistribute.** After a delete, if the leaf's encoded size drops below `HALF_FULL_THRESHOLD * page_size_bytes`, find the immediate **same-parent** left and right siblings by looking at the parent's `slots` / `leftmost_child_page_id` (**not** via `right_sibling_page_id`, which can cross parent boundaries; merging requires same-parent siblings). If a sibling has spare bytes such that moving one record leaves both siblings ≥ 40% full, redistribute and update the parent's separator. Otherwise, merge: combine the two leaves into one, splice out the freed page id from the sibling chain, remove the corresponding separator from the parent. The freed page id *leaks* in iteration 3 (nothing is tracking freed pages yet); iteration 6 will introduce the freelist. The parent may now be under-full — recurse symmetrically.
 
-For brevity I'll group these — refer to spec §5 for the algorithm details and to spec §8.6 for the invariants.
+8. **Internal merge propagation and root collapse.** Internal merges concatenate the two children plus a separator pulled down from the parent. If the root is left with only one child, collapse: `pager.update_meta(root_page_id=that_child)`.
 
-- Hand-built two-level tree: `search` returns correct values for keys in both leaves and edge cases.
+**Helper functions you'll want in `tree.py`:**
+
+- `_encoded_size_estimate(page) -> int` — walks the slot list summing header + slot directory + record bodies, without actually calling `encode_page`. Used in split/merge decisions.
+- `_find_leaf(key) -> (leaf_page_id, path)` — returns the leaf that would contain `key` and the path of `(parent_id, child_index)` entries. Used by `search`, `insert`, and `delete`.
+
+#### The invariant helper (`_debug.py`)
+
+```python
+def assert_tree_invariants(tree: BTree) -> None
+    # Walks the entire tree and asserts:
+    #   1. All leaves are at the same depth.
+    #   2. Every non-root page uses >= HALF_FULL_THRESHOLD of the page.
+    #   3. Every page's slot list is sorted ascending by key.
+    #   4. Internal node separators correctly partition the children:
+    #      max(child[i]) < separator[i] <= min(child[i+1]).
+    #   5. Leaf sibling pointers form a complete forward chain in key order,
+    #      with no cycles.
+    #   6. Every page reachable from the tree has a page id < next_page_id.
+    # On failure, raise AssertionError with a dump_tree(tree) rendering so
+    # the test output is debuggable.
+
+def dump_tree(tree: BTree) -> str
+    # Human-readable BFS walk of the tree. Used in assertion messages.
+```
+
+Call `assert_tree_invariants(tree)` from every property test after every operation. It is the test you will thank yourself for.
+
+#### Tests (`tests/unit/test_tree.py`)
+
+- Hand-built two-level tree: `search` returns correct values for keys in both leaves, at boundaries, and for absent keys.
 - Single-leaf insert (no split): all keys readable.
 - Insert until split: tree has two leaves with correct distribution and a new root; sibling chain is correct.
 - Insert until two levels of internal nodes: invariants hold throughout (mark slow).
-- Internal split moves the median: the median key does NOT appear in either of the two resulting internal nodes after the split, only in the new parent.
-- `scan` over a multi-leaf tree returns all keys in order.
-- `scan` with bounds returns the correct half-open range.
-- Delete present and absent keys.
+- Internal split moves the median: the median key does NOT appear in either of the two resulting internal nodes, only in the new parent.
+- `scan` over a multi-leaf tree returns all keys in order; bounded scans return the correct half-open range.
+- Delete of a present key returns `True`; delete of an absent key returns `False`.
 - Delete enough to force a redistribution: both leaves end up ≥ 40% full and the parent's separator is updated.
-- Delete enough to force a merge: the freed page id is recorded somewhere (today it leaks — we'll add the freelist in Iteration 6).
+- Delete enough to force a merge: the resulting tree still passes `assert_tree_invariants`.
 - Delete enough to force the root to collapse.
 - Insert/delete fuzzing: 1000 random ops, `assert_tree_invariants` after every op.
 
-**Wire it into `DB`:**
+Suggested commit: `feat(tree): on-disk B+ tree with split and merge`.
 
-Now in `db.py`:
+### Sub-step 3d: Wire the tree into `DB`
 
-- Delete `_inmem.py`. (This is the only throwaway in the entire project.)
-- Construct a `Pager` and a `BTree` in the `DB` open path (after the `WAL`).
-- After the `WAL.replay()` call, the records are now applied to the *tree* instead of the in-memory dict. Each PUT in the WAL becomes `tree.insert(key, value)`; each DELETE becomes `tree.delete(key)`. The tree starts empty (the meta page's `root_page_id` points to an empty leaf created by the pager constructor).
-- `put` still appends to the WAL and fsyncs, then calls `tree.insert`. Same pattern as before, just with a different backing structure.
-- `delete` likewise.
-- `get` becomes `tree.search`.
-- `scan` becomes `tree.scan`.
-- `close` calls `pager.flush_meta()`, `pager.fsync()`, `wal.fsync()`, `wal.close()`, `pager.close()`. (Note: `flush_meta` is called manually here today; in Iteration 5 the checkpoint procedure takes over.)
+Now that `pager.py` and `tree.py` exist, rewire `db.py`:
+
+- Remove the `SortedDict` attribute and everything that touches it. This is the only throwaway in the project.
+- Add `page_size_bytes: int = 4096` to the `DB.__init__` signature, after `data_dir`.
+- In `__init__`, also instantiate a `Pager(data_dir / "bptreedb.data", page_size_bytes=page_size_bytes)` and a `BTree(pager)`. Do not open them.
+- Add `self._version_counter = 0`.
+- `open()` — create `data_dir` if it doesn't exist (iteration 2 logic). Open the pager. Open the WAL. `wal.replay(self._apply_wal_record)`. Flip `is_opened`.
+- `_apply_wal_record(record)` now becomes: `WALPutRecord` → `self._tree.insert(record.key, record.value)`; `WALDeleteRecord` → `self._tree.delete(record.key)`. Does not touch the version counter.
+- `put(key, value)` — checks, `wal.append_put(key, value)`, `tree.insert(key, value)`, bump version counter.
+- `delete(key)` — checks, `wal.append_delete(key)` *only* if the key is present (you need a way to know — either do a `tree.search` first, or have `tree.delete` return `False` without mutating and have `DB.delete` consult the return value). Prefer the second approach: call `tree.search` first to decide whether to log, then call `tree.delete`. Bump the counter on success only.
+- `get(key)` — checks, `return tree.search(key)`. No counter bump.
+- `scan(start, end)` — checks eagerly (not in the generator body), snapshot the counter, and return `tree.scan(start, end, version_check=...)` where the callback compares the live counter to the snapshot and raises.
+- `close()` — `pager.flush_meta()`, `pager.close()`, `wal.close()`. Clear the version counter for good measure.
+
+> **Note on `delete`'s "only log if present" rule.** In iteration 2, the in-memory dict made the presence check cheap (`key in self.data`). On a real tree, `tree.search` is O(log N) disk reads, which doubles the cost of every delete. That's acceptable in iteration 3. Iteration 4's buffer pool will make it cheap again.
 
 ### Tests that earn the milestone
 
@@ -453,7 +693,7 @@ Now in `db.py`:
 
 **New unit tests for the version counter** (added to `tests/unit/test_db.py`):
 
-- `scan` followed by `put` raises `DBConcurrentModificationError` on the next `next()`.
+- `scan` followed by `put` raises `DBConcurrentPageModificationError` on the next `next()`.
 - `scan` followed by a *successful* `delete` raises likewise.
 - `scan` followed by a `delete` of an absent key (returns `False`) does NOT raise — failed deletes are not mutations.
 - `scan` followed by `get` does NOT raise — search is not a mutation.
@@ -494,40 +734,40 @@ Because Iteration 3 left you with a database where every read and every write go
 
 **A new constructor parameter earns its place:** `cache_capacity_pages` on `DB`, default 256. This is the capacity of the buffer pool that exists for the first time in this iteration.
 
-A new module: `cache.py`. A new test file: `tests/unit/test_cache.py`. Modifications to `pager.py` (or the tree's pager interface) so that all page reads and writes go through the cache.
+A new module: `cache.py`. A new test file: `tests/unit/test_cache.py`. Modifications to `tree.py` so that all page reads and writes go through the cache instead of the pager.
 
-The `BufferPool` class:
+**`last_modified_lsn` earns its place.** Add it as a field to `LeafPage` and `InternalPage` in `entities.py`, and grow the slotted-page header in `codec.py` from 24 bytes to 32 bytes, with `last_modified_lsn` at offset 16 and `right_sibling_page_id` / `leftmost_child_page_id` shifting to offset 24. Update `codec.max_record_body_size` to account for the new header size. This is the one place where an existing codec test from iteration 3 gets edited rather than added to — the `test_codec.py` tests that assert "byte N of the header is field X" must follow the new layout.
 
-- Constructor: `BufferPool(pager, capacity_pages)`.
-- Internally an `OrderedDict[page_id, CachedPage]` where each `CachedPage` carries the page bytes, a `dirty: bool`, and (newly!) a `last_modified_lsn: int`.
-- `get(page_id) -> bytes` — cache hit moves the page to MRU and returns its buffer; cache miss reads from the pager, stores it in the cache, evicts the LRU clean page if at capacity. **Dirty pages are pinned and cannot be evicted.** If the cache is at capacity and every page is dirty, raise a sentinel `BufferPoolFull` (the DB layer will catch it in Iteration 5 and trigger a checkpoint; for now, just propagate it as an error — you won't hit it in tests yet).
-- `mark_dirty(page_id, lsn) -> None` — sets `dirty = True` and `last_modified_lsn = max(current, lsn)`.
-- `flush_all() -> None` — writes every dirty page back to the pager via `pager.write_page` and marks them clean. Used by `close` (and, in Iteration 5, by checkpoint).
-- `dirty_count()`, `dirty_page_ids()` for testability and for the auto-checkpoint trigger in Iteration 5.
+**Why `last_modified_lsn` earns its place *now*.** In iterations 3, the tree was the only thing writing pages, and it did so synchronously: every mutation immediately re-encoded the page and wrote it through. Once the buffer pool exists, pages may be evicted or flushed at times the tree no longer controls. The LSN field ties each page to the WAL record that last touched it, so the buffer pool / checkpoint logic can enforce the rule "no page hits disk until the WAL record that protects it is fsynced." That is the WAL ordering rule.
 
-**Now is the moment to introduce `last_modified_lsn`.** Add it to the page header. The header grows from 24 bytes to 32. Update `page.py` accordingly:
+In this iteration the rule is automatically satisfied because every `put` calls `wal.append + wal.fsync` *before* `tree.insert`, so by the time the tree calls `mark_dirty(page_id, lsn)`, the WAL record at `lsn` has already been fsynced. The LSN field therefore doesn't *do* anything observable in iteration 4 — it's bookkeeping. It earns its place in iteration 5 as the checkpoint cursor, and would earn a second role in a hypothetical iteration 7 that switched to a STEAL policy.
 
-- Header layout becomes the spec layout from §4.2.2 with `last_modified_lsn` at offset 16. The `right_sibling` field that was at offset 16 moves to offset 24. Total header size: 32.
-- Update `max_record_payload_size` to account for the new header size.
+#### The `BufferPool` class
 
-You also have to update the *codec* tests in `test_page.py` because the header size changed. This is the only place in the project where an existing test gets edited (rather than added to or left alone). The tests are checking the literal layout, so they have to follow it.
+The buffer pool caches *decoded* `LeafPage` / `InternalPage` dataclasses, not raw bytes. On a miss it calls `pager.read_page` and then `codec.decode_page`. On `flush_all` it calls `codec.encode_page` and then `pager.write_page`. This is the whole point of the entities/codec split: the pool holds objects the tree can mutate directly, and only crosses the byte boundary at flush time.
 
-Why `last_modified_lsn` exists, justified now: because dirty pages may be evicted or flushed at times the tree no longer controls. The LSN field ties each page to the WAL record that last touched it, so that the buffer pool / checkpoint logic can enforce the rule "no page hits disk until the WAL record that protects it is fsynced." That rule is the WAL ordering rule. In this iteration, the rule is automatically satisfied because:
+| name | kind | signature | behaviour |
+|---|---|---|---|
+| `__init__` | method | `BufferPool(pager: Pager, capacity_pages: int) -> None` | Store the pager and capacity. Initialize an empty `OrderedDict[int, CachedPage]`. |
+| `capacity_pages` | attribute | `int` | Maximum number of pages held in memory. |
+| `dirty_count` | property | `int` | Number of dirty pages currently pinned. |
+| `get` | method | `get(page_id: int) -> LeafPage \| InternalPage` | Cache hit → move to MRU, return the cached dataclass. Miss → `pager.read_page`, `codec.decode_page`, insert at MRU, evict the LRU *clean* entry if at capacity. If the pool is full and every page is dirty, raise `BufferPoolFull`. |
+| `mark_dirty` | method | `mark_dirty(page_id: int, lsn: int) -> None` | Set the cached entry's `dirty=True` flag and update its page's `last_modified_lsn = max(current, lsn)`. |
+| `flush_all` | method | `flush_all() -> None` | For every dirty entry: `codec.encode_page(page, page_size_bytes)` and `pager.write_page`. Clear the dirty flag. Does not fsync. |
+| `dirty_page_ids` | method | `dirty_page_ids() -> list[int]` | For tests and for the auto-checkpoint trigger in iteration 5. |
 
-- Every `put` calls `wal.append + wal.fsync` *before* `tree.insert` is called.
-- Therefore by the time the tree calls `mark_dirty(page_id, lsn)`, the WAL record at `lsn` has already been fsynced.
-- Therefore even if the buffer pool turns around and writes the dirty page to disk immediately, the WAL is ahead of it.
+Internally, each cached entry is a tiny record carrying `(page, dirty: bool)`. Use an `OrderedDict` and `move_to_end` to implement LRU, since `last_modified_lsn` now lives on the page dataclass itself.
 
-So the LSN field doesn't *do* anything you can observe in Iteration 4 — it's bookkeeping. It earns its place in Iteration 5 (as the checkpoint cursor) and would earn its place in a hypothetical Iteration 7 that switches to a STEAL policy.
+#### Wiring
 
-In the tree (`tree.py`), modify every place that previously called `pager.read_page` to call `buffer_pool.get` instead, and every place that mutated a page to call `buffer_pool.mark_dirty(page_id, current_lsn)` after the mutation. The current LSN is passed in by `DB.put` and `DB.delete` (which get it from `wal.append_*`) and threaded down to the tree.
+In `tree.py`, replace every `pager.read_page` + `codec.decode_page` with a single `buffer_pool.get(page_id)`, and replace every "encode and write" at the end of a mutation with a single `buffer_pool.mark_dirty(page_id, current_lsn)`. The current LSN is the LSN returned by `wal.append_put` / `wal.append_delete`, which `DB.put` / `DB.delete` now thread into `tree.insert` / `tree.delete`.
 
 In `db.py`:
 
-- Construct a `BufferPool` wrapping the pager in the `DB` open path.
-- The tree is given the buffer pool, not the pager directly. (The pager is still used by the buffer pool internally.)
-- `close` calls `buffer_pool.flush_all()` before `pager.fsync()`, so all dirty pages are persisted on shutdown. (`pager.flush_meta` and `pager.close` come after.)
-- `_debug` namespace (in `_debug.py`) gains `dirty_pages_in_cache()` and `total_pages_in_file()` for tests.
+- Construct a `BufferPool(pager, cache_capacity_pages)` in `open()`.
+- Pass the buffer pool to `BTree`, not the raw pager.
+- `close()` calls `buffer_pool.flush_all()` before `pager.flush_meta()` and `pager.fsync()`, so all dirty pages are persisted on shutdown.
+- The `_debug` namespace gains `dirty_pages_in_cache()` and `total_pages_in_file()` for tests.
 
 ### Tests that earn the milestone
 
@@ -548,7 +788,7 @@ The same database as Iteration 3, but **fast enough to actually use**. Repeated 
 
 ### The flaw you'll feel next
 
-The WAL still grows forever. You haven't fixed that yet — you've only fixed the slowness. Open a long-running DB, watch `wal.log` grow, restart the DB, watch the open take longer and longer as the WAL replay does more work. The fix is checkpoints.
+The WAL still grows forever. You haven't fixed that yet — you've only fixed the slowness. Open a long-running DB, watch `bptreedb.wal` grow, restart the DB, watch the open take longer and longer as the WAL replay does more work. The fix is checkpoints.
 
 ---
 
@@ -570,43 +810,68 @@ Because Iteration 4 left you with an unbounded WAL. Recovery scales linearly wit
 2. **`checkpoint_wal_size_bytes` parameter** on `DB`, default 4 MiB. Auto-checkpoint trigger: when the WAL grows past this size, the next put/delete triggers a checkpoint.
 3. **`checkpoint_dirty_page_ratio` parameter** on `DB`, default 0.5. Auto-checkpoint trigger: when the fraction of dirty pages in the buffer pool exceeds this ratio, the next put/delete triggers a checkpoint.
 
-In `wal.py`:
+#### Add to `entities.py`
 
-- A new op type `OP_CHECKPOINT = 0x03` with payload `root_page_id(8) | freelist_head(8) | next_page_id(8)`. (Yes, the payload includes `freelist_head` even though the freelist doesn't exist yet — set it to 0 for now and Iteration 6 will populate it without needing to change the payload format. This is one of the few places I'm letting future-proofing leak in, because adding a field to a WAL record format later means a version bump. Acceptable.)
-- `append_checkpoint(root_page_id, freelist_head, next_page_id) -> int`.
-- `truncate_before(lsn)` — discards records with `lsn < given_lsn`. Implementation: write a new file `wal.log.new`, copy any records ≥ `lsn` (usually just the CHECKPOINT marker), `os.fsync` the new file, `os.replace` over `wal.log`, `os.fsync` the directory. Reopen the underlying file handle.
-- `size_bytes` (property) — current on-disk size of the WAL.
+```python
+@dataclass
+class WALCheckpointRecord(WALRecord):
+    root_page_id: int
+    freelist_head: int      # Always 0 in iteration 5; iteration 6 will populate it.
+    next_page_id: int
+```
 
-**Add `last_checkpoint_lsn` to the meta page.** This is the iteration that earns it. Insert the new field after `next_page_id`; the CRC moves to make room. Total meta page header grows from 36 bytes (Iteration 3) to 44 bytes. Update `pager.py` and `test_pager.py`. (The final layout in spec §4.2.1 also contains `freelist_head`, which doesn't exist yet — Iteration 6 will add it. Until then, you may diverge from the spec's exact offsets; the spec is the destination, not a step-by-step contract.)
+The `freelist_head` field is included even though the freelist doesn't exist yet — it's set to `0` for now and iteration 6 will populate it without needing to change the WAL record format. Adding a field to a WAL record format after the fact would require a version bump; future-proofing the payload by one field is cheaper.
 
-Why `last_checkpoint_lsn` exists, justified now: because recovery needs to know which WAL records are already reflected in the data file (and must be skipped) and which are not (and must be replayed). The meta page is the place to record this because it is the entry point for `open()`.
+#### Add to `codec.py`
 
-In `db.py`, add `db.checkpoint()` per spec §6.4 exactly:
+A new op type `0x03 CHECKPOINT` in `encode_wal_record` / `decode_wal_record`. CHECKPOINT payload: `root_page_id(8) | freelist_head(8) | next_page_id(8)`.
 
-1. Note `wal.next_lsn` as `ckpt_lsn`.
-2. `buffer_pool.flush_all()`.
-3. `pager.fsync()`.
-4. `wal.append_checkpoint(...)`. `wal.fsync()`.
-5. `pager.update_meta(last_checkpoint_lsn=ckpt_lsn, root_page_id=..., next_page_id=...)`. `pager.flush_meta()`. `pager.fsync()`.
-6. `wal.truncate_before(ckpt_lsn)`.
+Grow `MetaPage` in `entities.py` with a `last_checkpoint_lsn: int = 0` field, and update `encode_meta_page` / `decode_meta_page` to include it. Insert the new field after `next_page_id` in the wire format; the CRC moves to make room. The total header grows from 36 bytes (iteration 3) to 44 bytes. Update the codec tests for the new layout. (Iteration 6 will add one more meta-page field, `freelist_head`.)
 
-Walk through the crash window analysis from spec §6.5 carefully — the order of these steps matters. If you crash between any two of them, the next `open()` must produce a consistent database. The plan does not repeat the analysis; refer to spec §6.5.
+Why `last_checkpoint_lsn` earns its place *now*: recovery needs to know which WAL records are already reflected in the data file (and must be skipped) and which are not (and must be replayed). The meta page is the place to record this because it is the entry point for `open()`.
 
-Also implement the **automatic checkpoint triggers** from spec §6.1:
+#### Grow `wal.py`
 
-- After every `put` and `delete`, check whether `wal.size_bytes > checkpoint_wal_size_bytes` OR `buffer_pool.dirty_count() / cache_capacity_pages > checkpoint_dirty_page_ratio`. If so, call `checkpoint()`.
-- When `tree.insert` raises `BufferPoolFull`, call `checkpoint()` and retry once.
-- When `db.close()` is called.
+| name | kind | signature | behaviour |
+|---|---|---|---|
+| `append_checkpoint` | method | `append_checkpoint(root_page_id: int, freelist_head: int, next_page_id: int) -> int` | Build a `WALCheckpointRecord`, encode, append, fsync, return its LSN. |
+| `truncate_before` | method | `truncate_before(lsn: int) -> None` | Discard records with `lsn < given_lsn`. Implementation: open `bptreedb.wal.new`, copy any records `≥ lsn` (usually just the CHECKPOINT marker itself), `fs.fsync_file`, `os.replace` over `bptreedb.wal`, `fs.fsync_directory` on the parent. Reopen the underlying file handle. |
+| `size_bytes` | property | `int` | Current on-disk size of the log file. |
 
-And implement the **recovery procedure** from spec §6.3 in the `DB` open path (i.e., `__enter__` / `db.open()`):
+On `open()`, also check for a stale `bptreedb.wal.new` file: if it exists, remove it (a previous `truncate_before` crashed mid-rotation; the live `bptreedb.wal` is still authoritative).
 
-1. The pager has already validated the meta page in its constructor. (If the CRC fails, `DBCorruptError` is raised there.)
-2. Construct the tree from `meta.root_page_id`. Construct the WAL.
-3. Call `wal.replay()` and walk every record (torn-tail truncation already happens here from Iteration 2).
-4. Skip records with `lsn ≤ meta.last_checkpoint_lsn`.
-5. For each remaining PUT or DELETE, call `tree.insert` or `tree.delete`. CHECKPOINT records are skipped.
-6. **Disable buffer pool eviction during recovery** by passing a flag (or temporarily setting capacity to infinity), so the pool can grow unbounded during replay without raising `BufferPoolFull`.
-7. After replay, restore the cap and immediately call `checkpoint()` to persist the recovered state.
+#### The `checkpoint()` procedure in `DB`
+
+The order of these steps is load-bearing. If you crash between any two of them, the next `open()` must produce a consistent database. The spec's §6.5 walks through the crash analysis; here's just the procedure itself.
+
+1. `ckpt_lsn = wal.current_lsn + 1` — the LSN the next record will use. All records *before* this point are about to be persisted; everything from this point on belongs to the next checkpoint window.
+2. `buffer_pool.flush_all()` — every dirty page now lives in the data file buffer (but not yet on disk).
+3. `pager.fsync()` — everything described by WAL records with `lsn < ckpt_lsn` is now durably in the data file.
+4. `wal.append_checkpoint(root_page_id, 0, next_page_id)`. This append calls `wal.fsync()` internally.
+5. `pager.update_meta(last_checkpoint_lsn=ckpt_lsn, root_page_id=..., next_page_id=...)`, then `pager.flush_meta()`, then `pager.fsync()`.
+6. `wal.truncate_before(ckpt_lsn)`. The CHECKPOINT marker itself at `ckpt_lsn` is retained as the new "first record."
+
+**The load-bearing correctness property** comes from the NO-STEAL policy: because no dirty pages were ever written outside of a checkpoint, the data file at recovery time is *always either entirely pre- or entirely post- a given checkpoint*. There is no "half-applied" intermediate state. This is why `bptreedb` uses NO-STEAL rather than the more performant STEAL policies that production engines use.
+
+#### Automatic checkpoint triggers
+
+After every `put` and `delete`, check whether any of these are true, and if so, call `checkpoint()`:
+
+- `wal.size_bytes > checkpoint_wal_size_bytes`
+- `buffer_pool.dirty_count / cache_capacity_pages > checkpoint_dirty_page_ratio`
+
+Additionally:
+
+- When `tree.insert` or `tree.delete` raises `BufferPoolFull`, call `checkpoint()` and retry the operation once.
+- When `db.close()` is called, take a final checkpoint.
+
+#### The recovery procedure in `DB.open()`
+
+1. The pager has already validated the meta page during its `open()`. (If the CRC fails, `DBCorruptedError` is raised there.)
+2. Open the WAL. Call `wal.replay(self._apply_wal_record_for_recovery)`.
+3. In the recovery callback, skip records with `lsn ≤ meta.last_checkpoint_lsn` — those are already reflected in the data file. For remaining PUT / DELETE records, call `tree.insert` / `tree.delete`. CHECKPOINT records are always skipped.
+4. **Disable buffer-pool eviction during recovery** — pass a flag to the buffer pool (or temporarily set its capacity to effectively infinite) so the pool can grow unbounded during replay without raising `BufferPoolFull`. A crash during recovery would leak partially-applied state into the data file if eviction were allowed.
+5. After replay, restore the cap and immediately call `checkpoint()` to persist the recovered state.
 
 ### Tests that earn the milestone
 
@@ -615,7 +880,7 @@ And implement the **recovery procedure** from spec §6.3 in the `DB` open path (
   - Encode/decode CHECKPOINT round-trip.
   - `truncate_before(lsn)` removes all earlier records and preserves all later ones.
   - Replay after truncation yields only the preserved records.
-  - Crash safety of the rotation: hand-craft a `wal.log` and a stale `wal.log.new`; opening the WAL ignores or removes the stale `.new` and leaves `wal.log` intact.
+  - Crash safety of the rotation: hand-craft a `bptreedb.wal` and a stale `bptreedb.wal.new`; opening the WAL ignores or removes the stale `.new` and leaves `bptreedb.wal` intact.
 - `test_pager.py` updates for the new `last_checkpoint_lsn` field and the larger meta page.
 - New `tests/integration/test_checkpoint.py`:
   - Manual `checkpoint()` truncates the WAL: after, `wal.size_bytes` is small (just the CHECKPOINT marker) and `replay()` yields only that marker.
@@ -635,7 +900,7 @@ A database where the WAL stays bounded, recovery is fast (proportional to the WA
 
 ### The flaw you'll feel next
 
-Delete a few thousand keys from a populated database and watch `data.db` *not shrink*. Pages that the tree has merged out of existence are leaked — they remain in the file forever, taking up space, never reused. The fix is a freelist.
+Delete a few thousand keys from a populated database and watch `bptreedb.data` *not shrink*. Pages that the tree has merged out of existence are leaked — they remain in the file forever, taking up space, never reused. The fix is a freelist.
 
 ---
 
@@ -651,17 +916,34 @@ Because Iteration 5 left you with a file that grows monotonically — there is n
 
 ### What you build
 
-**Add `freelist_head` to the meta page.** Append it after `last_checkpoint_lsn`; the CRC moves to make room. The meta page header grows from 44 bytes (Iteration 5) to 52 bytes. The set of fields now matches spec §4.2.1, though the on-disk order may differ from the spec's exact offsets — that's fine; the spec was written assuming all fields exist at once, and the implementation order chose to append rather than insert. If you'd rather have the on-disk layout match the spec exactly, you can rearrange fields in the encoder at this iteration; it's a one-time cost and the round-trip tests will tell you if you got it wrong.
+#### Add to `entities.py`
 
-Add a third page type tag, `TYPE_FREELIST = 0x03`, in `page.py`. A freelist page is *not* a slotted page — it has a simpler layout:
+```python
+@dataclass
+class FreelistPage:
+    last_modified_lsn: int
+    next_freelist_page_id: int            # 0 if this is the tail
+    freed_page_ids: list[int]
+```
 
-- The standard page header (so the type tag is in the same place and the page is parseable by generic code).
-- 8 bytes: `next_freelist_page_id` (forming a singly linked list of freelist pages).
-- An array of 8-byte freed page ids, with `num_slots` (from the standard header) repurposed to mean "number of freed page ids stored on this page."
+Add a `freelist_head: int = 0` field to `MetaPage`.
 
-Helper functions to encode/decode a freelist page; max capacity per freelist page = `(page_size_bytes - HEADER_SIZE - 8) // 8`.
+#### Grow `codec.py`
 
-In `pager.py`, modify `allocate_page` and add `free_page`:
+Add a third page type tag, `0x03 FREELIST`. A freelist page is *not* a slotted page — it has a simpler layout:
+
+- The same 32-byte page header as leaves and internal nodes, with `type_tag = 0x03` and `num_slots` repurposed to mean "number of freed page ids stored on this page." The `right_sibling_page_id` slot (offset 24) is repurposed to hold `next_freelist_page_id`, which keeps the header a single fixed shape.
+- After the header, an array of 8-byte freed page ids.
+
+Expose `max_freed_ids_per_freelist_page(page_size_bytes) -> int = (page_size_bytes - 32) // 8`.
+
+Extend `encode_page` and `decode_page` to dispatch on `type_tag` and handle `FreelistPage` as a third case. Update `encode_meta_page` / `decode_meta_page` to include `freelist_head`; the total header grows from 44 bytes (iteration 5) to 52 bytes.
+
+Also: in `codec.encode_wal_record`'s CHECKPOINT branch, populate the `freelist_head` field with the real value from the `WALCheckpointRecord` dataclass (which iteration 5 was always setting to `0`).
+
+#### Grow `pager.py`
+
+Modify `allocate_page` and add `free_page`:
 
 - `allocate_page() -> int`:
   - If `meta.freelist_head != 0`, read the head freelist page, pop one id from its array, write the page back. If the head becomes empty, advance `meta.freelist_head` to its `next_freelist_page_id` and free the now-empty freelist page (push it to the new head — but **bump-allocate any new freelist pages directly**, never via the freelist itself, to break the circular dependency).
@@ -744,43 +1026,36 @@ A finished educational repository. A working B+ tree database. A spec describing
 
 ## Coverage check
 
-Quick map of spec sections to iterations, so you can verify that nothing in the spec is unimplemented at the end:
+Quick map of features to iterations, so you can verify that nothing is unimplemented at the end:
 
-| Spec section                       | Iteration where it earns its place                  |
-|------------------------------------|-----------------------------------------------------|
-| §3 Architecture (six layers)       | Spread across 1–6, in motivated order               |
-| §4.1 Directory layout              | Iter 2 (`wal.log`), Iter 3 (`data.db`)              |
-| §4.2.1 Meta page                   | Iter 3 (initial), Iter 5 (`last_checkpoint_lsn`), Iter 6 (`freelist_head`) |
-| §4.2.2 Slotted page layout         | Iter 3 (initial 24-byte header), Iter 4 (32-byte with `last_modified_lsn`) |
-| §4.2.3 Freelist page               | Iter 6                                              |
-| §4.3 Size limits                   | Iter 3                                              |
-| §4.4 WAL framing                   | Iter 2 (PUT/DELETE), Iter 5 (CHECKPOINT)            |
-| §5.1 Tree invariants               | Iter 3 (`assert_tree_invariants`)                   |
-| §5.2 search                        | Iter 3                                              |
-| §5.3 insert + splits               | Iter 3                                              |
-| §5.4 delete + merge                | Iter 3 (algorithm), Iter 6 (`free_page` integration) |
-| §5.5 scan with version check       | Iter 1 (version counter), Iter 3 (across leaves)    |
-| §5.6 What gets logged              | Iter 2                                              |
-| §5.7 Determinism                   | Discipline; verified by the crash property test from Iter 2 onward |
-| §6.1 Buffer-pool policy            | Iter 4                                              |
-| §6.2 LSN bookkeeping               | Iter 4                                              |
-| §6.3 Recovery                      | Iter 2 (initial WAL replay), Iter 5 (with checkpoint cursor) |
-| §6.4 Checkpoint                    | Iter 5                                              |
-| §6.5 Crash-window analysis         | Iter 5 (validated by crash property test)           |
-| §7.1 DB API (no-arg constructor + put/get/delete/scan/close/CM) | Iter 1                |
-| §7.1 `dir_path` parameter          | Iter 2                                              |
-| §7.1 `page_size_bytes` parameter   | Iter 3                                              |
-| §7.1 `cache_capacity_pages` parameter | Iter 4                                           |
-| §7.1 `checkpoint()` + checkpoint parameters | Iter 5                                     |
-| §7.2 `DBClosedError`               | Iter 1                                              |
-| §7.2 `DBCorruptError`              | Iter 2                                              |
-| §7.2 `DBRecordTooLargeError`       | Iter 3                                              |
-| §7.2 `DBConcurrentModificationError` | Iter 3 (deferred from Iter 1 — earned only once `scan` is a real lazy iterator) |
-| §7.4 `_debug` namespace            | Iter 3 onward, growing as needed                    |
-| §8.1–8.4 Test categories           | Iter 1 (unit, property), Iter 2 (crash), all later iterations add more |
-| §8.5 `FaultyFile` infrastructure   | Iter 2                                              |
-| §8.6 `assert_tree_invariants`      | Iter 3                                              |
-| §8.7 Test conventions              | Iter 1                                              |
-| §9 Project structure               | Cumulative                                          |
-| §10 Planned v1 work                | Out of scope (deferred)                             |
-| §11 Companion doc outline          | Iter 7                                              |
+| Feature                                                | Iteration where it earns its place                           |
+|--------------------------------------------------------|--------------------------------------------------------------|
+| Directory layout (`bptreedb.wal`, `bptreedb.data`)     | Iter 2 (WAL), Iter 3 (data file)                             |
+| `MetaPage` dataclass and wire format                   | Iter 3 (initial), Iter 5 (`last_checkpoint_lsn`), Iter 6 (`freelist_head`) |
+| Slotted page header                                    | Iter 3 (initial 24-byte header), Iter 4 (32-byte with `last_modified_lsn`) |
+| Freelist page                                          | Iter 6                                                       |
+| Record size limit and `DBRecordTooLargeError`          | Iter 3                                                       |
+| WAL framing (PUT/DELETE/CHECKPOINT)                    | Iter 2 (PUT/DELETE), Iter 5 (CHECKPOINT)                     |
+| Tree invariants (`assert_tree_invariants`)             | Iter 3                                                       |
+| `search` / `insert` with splits                        | Iter 3                                                       |
+| `delete` with merge / redistribute                     | Iter 3 (algorithm), Iter 6 (freelist integration)            |
+| `scan` with version check across leaves                | Iter 3                                                       |
+| What gets logged (one WAL record per public mutation)  | Iter 2                                                       |
+| Determinism discipline                                 | Iter 3 onward; verified by the crash property test           |
+| NO-STEAL buffer-pool policy                            | Iter 4                                                       |
+| LSN bookkeeping on pages                               | Iter 4                                                       |
+| Recovery (WAL replay)                                  | Iter 2 (initial), Iter 5 (with checkpoint cursor)            |
+| Checkpoint procedure                                   | Iter 5                                                       |
+| Crash-window analysis                                  | Iter 5 (validated by crash property test)                    |
+| `DB` API: `put` / `get` / `delete` / `scan` / `close` / context manager | Iter 1                                      |
+| `DB(data_dir)` parameter                               | Iter 2                                                       |
+| `DB(..., page_size_bytes=...)` parameter               | Iter 3                                                       |
+| `DB(..., cache_capacity_pages=...)` parameter          | Iter 4                                                       |
+| `db.checkpoint()` + checkpoint parameters              | Iter 5                                                       |
+| `DBClosedError`                                        | Iter 1                                                       |
+| `DBCorruptedError`, `DBChecksumError`                  | Iter 2                                                       |
+| `DBRecordTooLargeError`                                | Iter 3                                                       |
+| `DBConcurrentPageModificationError`                    | Iter 3 (deferred from Iter 1 — earned only once `scan` is a real lazy iterator) |
+| `_debug` namespace                                     | Iter 3 onward, growing as needed                             |
+| Unit + property tests                                  | Iter 1                                                       |
+| `FaultyFile` crash-test infrastructure                 | Iter 2                                                       |
