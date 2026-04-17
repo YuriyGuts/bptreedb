@@ -479,7 +479,7 @@ After the 24-byte header comes the slot directory growing downward from offset 2
 **Leaf record body:** `key_length(4) | key | value_length(4) | value`
 **Internal record body:** `key_length(4) | key | child_page_id(8)`
 
-**Size limit.** The maximum encoded record body is `(page_size_bytes - 24) // 4 - 8` bytes. For `page_size_bytes = 4096` this is 1008 bytes; for 256 it is 48 bytes. The `/4` guarantees at least four records fit in an empty page, which keeps the half-full invariant achievable. Expose this as a function `max_record_body_size(page_size_bytes) -> int` in `codec.py` so the tree can call it from both the size check in `put` and the split decision.
+**Size limit.** The maximum encoded record body is `(page_size_bytes - 24) // 5 - 8` bytes. For `page_size_bytes = 4096` this is 806 bytes; for 256 it is 38 bytes. The `/5` keeps `max_slot_size < 0.2 * page_size + 24`, which is what lets the split algorithm always find a partition with both halves above the 40% threshold; `/4` would technically still guarantee "at least four records fit in an empty page", but with larger slots an unbalanced split can leave one half underfull. Expose this as a function `max_record_body_size(page_size_bytes) -> int` in `codec.py` so the tree can call it from both the size check in `put` and the split decision.
 
 #### Add to `codec.py`
 
@@ -543,7 +543,7 @@ The data file is `N * page_size_bytes` bytes for some `N ≥ 2`: page 0 is the m
 | `__init__` | method | `Pager(path: Path, *, page_size_bytes: int, _file_factory=...) -> None` | Store the path and requested page size. No filesystem work. |
 | `path` | attribute | `Path` | Path to `bptreedb.data`. |
 | `page_size_bytes` | attribute | `int` | Honoured from the on-disk meta page after `open()` for existing databases. |
-| `num_pages` | property | `int` | Current file size divided by `page_size_bytes`. |
+| `num_pages` | property | `int` | Return `meta.next_page_id`. This is the authoritative page count — do not derive it from the file size, which can disagree due to write buffering. |
 | `open` | method | `open() -> None` | If the file does not exist: create it, write an initial meta page with `root_page_id=1, next_page_id=2`, bump-allocate page 1 as an empty `LeafPage(right_sibling_page_id=0, slots=[])` and write it, fsync the file, fsync the parent directory. If the file exists: read and decode the meta page (raise `DBCorruptedError` on checksum or magic failure), adopt its stored `page_size_bytes`. |
 | `close` | method | `close() -> None` | If the meta is dirty, `flush_meta()`. Then fsync and close the file. |
 | `read_page` | method | `read_page(page_id: int) -> bytes` | Seek to `page_id * page_size_bytes` and read exactly `page_size_bytes` bytes. No decoding. |
@@ -554,9 +554,11 @@ The data file is `N * page_size_bytes` bytes for some `N ≥ 2`: page 0 is the m
 | `flush_meta` | method | `flush_meta() -> None` | Re-encode the in-memory meta via `codec.encode_meta_page` and write it to page 0 via `write_page`. Clear the dirty flag. Does not fsync. |
 | `allocate_page` | method | `allocate_page() -> int` | Return `meta.next_page_id` and bump it (`update_meta(next_page_id=meta.next_page_id + 1)`). Extend the file by one zero-filled page so `read_page` on the new id returns a valid buffer. (Iteration 6 will also consult the freelist first.) |
 
+**What "the meta is dirty" means at this iteration.** The Pager holds two pieces of state for the meta page: the in-memory `MetaPage` dataclass (returned by `get_meta`) and a single `_meta_dirty: bool` flag. `update_meta` mutates the dataclass and sets the flag to `True`; `flush_meta` encodes the dataclass, calls `write_page(0, ...)`, and sets the flag back to `False`; `close` checks the flag and calls `flush_meta` if needed. That's the whole mechanism — one boolean on the Pager instance. There is no per-page dirty tracking for *data* pages at this iteration, because data pages are written through immediately by the tree (see next point) and therefore can't be "dirty" in any meaningful sense.
+
 **Two deliberate simplifications at this iteration:**
 
-1. **There is no buffer pool yet.** `read_page` and `write_page` go to disk every time. This will be slow; you will *feel* the slowness, and that feeling is what motivates iteration 4.
+1. **There is no buffer pool yet.** `read_page` and `write_page` go to disk every time. When the tree mutates a leaf, it re-encodes the page and immediately calls `pager.write_page` — the new bytes are in the OS page cache before the mutating method returns. Nothing is ever "dirty but not yet written" at the data-page level. This will be slow; you will *feel* the slowness, and that feeling is what motivates iteration 4. When iteration 4 adds the buffer pool, `mark_dirty` will gain a real meaning: "this cached page has been mutated in memory, and its new bytes have not yet reached the pager" — plus a per-page `dirty: bool` flag on every cache entry to track exactly that.
 2. **`flush_meta` is called only by `close`.** The meta page hits disk at most once per DB session. Iteration 5 (checkpoints) will take over that responsibility.
 
 #### Tests (`tests/unit/test_pager.py`)
@@ -578,16 +580,99 @@ A new module: `tree.py`. A new test file: `tests/unit/test_tree.py`. A new `_deb
 
 The `BTree` class takes a `Pager` and exposes the algorithms. It does not know about WAL or recovery; it works purely in terms of page reads, page writes, and the meta page's `root_page_id`. In iteration 3 it asks the pager directly for pages; in iteration 4 you will thread the buffer pool in instead, and most of the tree code will be unchanged because a buffer-pool `get` returns the same kind of dataclass that `codec.decode_page` returns.
 
+#### How the tree, pager, and codec interact
+
+The pager deals exclusively in raw `bytes` buffers — it does not know what a `LeafPage` or `InternalPage` is. The codec converts between raw bytes and typed dataclasses. The tree is the glue: it calls the pager to get bytes, then calls the codec to interpret them.
+
+**Reading a page** (used by every tree operation):
+
+```python
+raw: bytes       = self.pager.read_page(page_id)          # pager → raw bytes
+page: LeafPage | InternalPage = codec.decode_page(raw)     # codec → dataclass
+```
+
+**Writing a page** (used after every mutation):
+
+```python
+raw: bytes = codec.encode_page(page, self.pager.page_size_bytes)  # dataclass → raw bytes
+self.pager.write_page(page_id, raw)                               # raw bytes → pager
+```
+
+Wrap these two patterns in private helpers on `BTree`:
+
+```python
+def _read_page(self, page_id: int) -> LeafPage | InternalPage:
+    return codec.decode_page(self.pager.read_page(page_id))
+
+def _write_page(self, page_id: int, page: LeafPage | InternalPage) -> None:
+    self.pager.write_page(page_id, codec.encode_page(page, self.pager.page_size_bytes))
+```
+
+Every tree method uses `_read_page` and `_write_page` — it never touches `pager.read_page` or `codec.decode_page` directly. This is the seam that iteration 4 will exploit: replacing `_read_page` / `_write_page` with `buffer_pool.get` / `buffer_pool.mark_dirty` without changing any of the tree logic.
+
+**Finding the root page id:** the tree gets it from the pager's meta page — `self.pager.get_meta().root_page_id`. After a split that creates a new root, the tree calls `self.pager.update_meta(root_page_id=new_root_id)` to update it.
+
+#### How `search` works, step by step
+
+`search(key)` is a top-to-bottom walk from the root to a leaf. Here is the complete algorithm:
+
+1. Read the root page id from the meta page: `page_id = self.pager.get_meta().root_page_id`.
+2. Read the page: `page = self._read_page(page_id)`.
+3. **If `page` is a `LeafPage`:** binary-search (or linear-search — the list is small) the `slots` list by `slot.key` for the target `key`. If found, return `slot.value`. If not found, return `None`.
+4. **If `page` is an `InternalPage`:** determine which child to descend into. An internal page has `leftmost_child_page_id` plus N slots, each slot being `InternalSlot(key, child_page_id)`. The slots act as separators: all keys in the subtree under `leftmost_child_page_id` are strictly less than `slots[0].key`; all keys in the subtree under `slots[0].child_page_id` are ≥ `slots[0].key` and < `slots[1].key`; and so on. So:
+   - Binary-search the slots for the *rightmost* slot where `slot.key <= key`.
+   - If you find one at index `i`, descend into `slots[i].child_page_id`.
+   - If no slot has `slot.key <= key` (i.e., `key` is less than all separators), descend into `leftmost_child_page_id`.
+   - Set `page_id` to the chosen child and go back to step 2.
+
+This is the entire algorithm. It terminates because the tree has finite depth, and every step descends one level.
+
+**A concrete example.** Imagine a tree with page size 256, containing keys `b"01"` through `b"09"`. The root is an internal page at page 3:
+
+```
+InternalPage(leftmost_child_page_id=1, slots=[InternalSlot(key=b"05", child_page_id=2)])
+```
+
+Leaf at page 1: `LeafPage(right_sibling_page_id=2, slots=[LeafSlot(b"01", ...), ..., LeafSlot(b"04", ...)])`
+Leaf at page 2: `LeafPage(right_sibling_page_id=0, slots=[LeafSlot(b"05", ...), ..., LeafSlot(b"09", ...)])`
+
+Searching for `b"03"`: read page 3 (internal), `b"03" < b"05"` so descend into `leftmost_child_page_id=1`, read page 1 (leaf), find `b"03"` in the slots, return its value.
+
+Searching for `b"07"`: read page 3 (internal), `b"07" >= b"05"` so descend into `child_page_id=2`, read page 2 (leaf), find `b"07"`, return its value.
+
+Searching for `b"99"`: read page 3 (internal), `b"99" >= b"05"` so descend into `child_page_id=2`, read page 2 (leaf), `b"99"` is not in the slots, return `None`.
+
+#### How `_find_leaf` factors out the walk
+
+The root-to-leaf walk appears in `search`, `insert`, `delete`, and `scan`. Factor it into a helper:
+
+```python
+def _find_leaf(self, key: bytes) -> tuple[int, LeafPage, list[tuple[int, int]]]:
+    """
+    Walk from root to the leaf that would contain `key`.
+
+    Return (leaf_page_id, leaf_page, path) where `path` is a list of
+    (parent_page_id, child_index) pairs.  `child_index` is the index into
+    the parent's slots that was followed, or -1 if the descent went through
+    `leftmost_child_page_id`.
+    """
+```
+
+`search` calls `_find_leaf` and then scans the leaf's slots. `insert` and `delete` also use the `path` to propagate splits and merges upward.
+
 **`BTree` class, iteration 3 surface.**
 
 | name | kind | signature | behaviour |
 |---|---|---|---|
 | `__init__` | method | `BTree(pager: Pager) -> None` | Store the pager. No other state — the root pointer lives in `pager.get_meta().root_page_id`, so there's nothing to cache here. |
 | `HALF_FULL_THRESHOLD` | class constant | `float = 0.4` | Minimum fraction of `page_size_bytes` that a non-root page must use for its encoded form after a delete. |
-| `search` | method | `search(key: bytes) -> bytes \| None` | Walk root → leaf, binary-searching each internal node. Return the value if the leaf contains the key, else `None`. |
-| `insert` | method | `insert(key: bytes, value: bytes) -> None` | Walk root → leaf, remembering the path as a stack of `(parent_page_id, child_index_in_parent)`. Insert in sorted position. If the leaf overflows, split it; propagate splits upward. Raise `DBRecordTooLargeError` if the encoded leaf-record body would exceed `codec.max_record_body_size(pager.page_size_bytes)`. |
-| `delete` | method | `delete(key: bytes) -> bool` | Walk root → leaf, remembering the path. If the key is absent, return `False`. Otherwise remove the slot. If the leaf drops below `HALF_FULL_THRESHOLD * page_size_bytes` encoded bytes, rebalance: redistribute or merge with a same-parent sibling; propagate upward; collapse the root if it is left with a single child. Return `True`. |
-| `scan` | method | `scan(start_key_inclusive: bytes \| None, end_key_exclusive: bytes \| None, version_check: Callable[[], None]) -> Iterator[tuple[bytes, bytes]]` | Find the leaf containing the start key. Walk leaves forward via `right_sibling_page_id`, yielding `(key, value)` pairs. At the top of every iteration — *before* yielding — call `version_check()`, which is the callback `DB` passes in; that callback raises `DBConcurrentPageModificationError` if the tree was mutated. Stop at the end bound or at a null `right_sibling_page_id`. |
+| `search` | method | `search(key: bytes) -> bytes \| None` | Call `_find_leaf(key)`, then binary-search the leaf's `slots` by key. Return the value if found, else `None`. |
+| `insert` | method | `insert(key: bytes, value: bytes) -> None` | Call `_find_leaf(key)` to get the leaf and path. Insert in sorted position. If the leaf overflows, split it; propagate splits upward using the path. Raise `DBRecordTooLargeError` if the encoded leaf-record body would exceed `codec.max_record_body_size(pager.page_size_bytes)`. |
+| `delete` | method | `delete(key: bytes) -> bool` | Call `_find_leaf(key)` to get the leaf and path. If the key is absent, return `False`. Otherwise remove the slot. If the leaf drops below `HALF_FULL_THRESHOLD * page_size_bytes` encoded bytes, rebalance: redistribute or merge with a same-parent sibling; propagate upward using the path; collapse the root if it is left with a single child. Return `True`. |
+| `scan` | method | `scan(start_key_inclusive: bytes \| None, end_key_exclusive: bytes \| None, version_check: Callable[[], None]) -> Iterator[tuple[bytes, bytes]]` | Call `_find_leaf(start_key_inclusive)` to find the starting leaf. Walk leaves forward via `right_sibling_page_id`, yielding `(key, value)` pairs. At the top of every iteration — *before* yielding — call `version_check()`, which is the callback `DB` passes in; that callback raises `DBConcurrentPageModificationError` if the tree was mutated. Stop at the end bound or at a null `right_sibling_page_id` (value 0). |
+| `_read_page` | method | `_read_page(page_id: int) -> LeafPage \| InternalPage` | `codec.decode_page(self.pager.read_page(page_id))`. |
+| `_write_page` | method | `_write_page(page_id: int, page: LeafPage \| InternalPage) -> None` | `self.pager.write_page(page_id, codec.encode_page(page, self.pager.page_size_bytes))`. |
+| `_find_leaf` | method | `_find_leaf(key: bytes) -> tuple[int, LeafPage, list[tuple[int, int]]]` | Walk root → leaf as described above. Return `(leaf_page_id, leaf_page, path)`. |
 
 **The version counter is owned by `DB`, not by `BTree`.** The tree takes a callback so that the check fires at the tree level without the tree needing to know about `DB`'s version field. `DB.scan` will implement the callback as something like:
 
@@ -602,6 +687,10 @@ def scan(self, start, end):
     return self._tree.scan(start, end, version_check=check)
 ```
 
+#### Crash safety of multi-page writes
+
+Splits, merges, and root changes touch multiple pages non-atomically. A crash mid-split can leave orphaned pages, dangling parent pointers, or half-written siblings. **This is fine in iteration 3** because the tree pages are not the source of truth — the WAL is. On recovery, `open()` replays the entire WAL into a fresh tree, so any on-disk tree corruption is discarded and rebuilt. The cost is that the WAL grows forever and recovery replays from the start of time. Iteration 5 (checkpoints) will introduce a way to establish a consistent on-disk tree state, after which only the WAL tail needs replaying.
+
 #### Bring the tree to life in this order
 
 Do not try to implement everything at once. Walk this ladder:
@@ -610,17 +699,199 @@ Do not try to implement everything at once. Walk this ladder:
 
 2. **`insert(key, value)` for the case where the leaf has room.** Walk to the leaf (remembering the path), locate the sorted position, `slots.insert(i, LeafSlot(key, value))`, `codec.encode_page` and `pager.write_page`. If the key already exists, overwrite the slot's `value`. Test by inserting many keys into a small page and `search`-ing each.
 
-3. **Leaf split.** If `len(codec.encode_page(leaf, page_size_bytes))` would overflow the page (detect this cheaply by computing encoded-size estimates from the slot list without actually encoding, *or* by letting `encode_page` raise and handling it), split before encoding: allocate a new leaf via `pager.allocate_page`, move the upper half of `slots` by *byte size, not by count*, into the new leaf, splice the new leaf into the sibling chain (`new_leaf.right_sibling_page_id = old_leaf.right_sibling_page_id; old_leaf.right_sibling_page_id = new_leaf_id`), write both. The promoted key is the smallest key in the new leaf. If the leaf was the root, allocate a new `InternalPage` root with `leftmost_child_page_id=old_root_id` and one slot `InternalSlot(promoted_key, new_leaf_id)`, then call `pager.update_meta(root_page_id=new_root_id)`.
+3. **Leaf split.** After inserting the new slot in step 2, check whether the leaf still fits in a page. Use `_encoded_size_estimate(leaf)` to check cheaply without encoding. If it overflows, split:
 
-4. **Internal split propagation.** When the parent is also full, split it the same way — with one asymmetry: the *median* separator is removed from both halves and promoted to the grandparent. (Leaf splits *copy* the smallest right-side key up; internal splits *move* the median up.) Recurse up the path stack. If you reach the root and it splits, allocate a new root via the same pattern as step 3.
+   **How a leaf split works, step by step:**
+
+   Starting state — leaf page 1 is full after inserting `b"05"`:
+   ```
+   Page 1 (leaf): slots=[("01",v), ("02",v), ("03",v), ("04",v), ("05",v)]
+                  right_sibling_page_id=0
+   Meta: root_page_id=1
+   ```
+
+   a. **Find the split point.** Walk the slot list, summing encoded byte sizes. The byte midpoint — the first index where the running total crosses half the page capacity — is the starting guess, and splitting by byte size rather than slot count matters because variable-length records mean equal counts don't guarantee equal sizes. The byte midpoint alone isn't always good enough, though: when one slot is much larger than the others, the half that falls on the wrong side of it can land below the 40% threshold, and the split would persist an underpopulated page. Handle that by starting at the byte midpoint and scanning outward for a split index where *both* halves are at or above threshold. Such an index is guaranteed to exist given the `/5` record cap, which bounds `max_slot_size < 0.2 * page_size + 24`.
+
+   b. **Allocate a new leaf:** `new_leaf_id = pager.allocate_page()`.
+
+   c. **Move the upper half of slots into the new leaf.** Suppose the split point is after index 2:
+   ```python
+   new_leaf = LeafPage(
+       right_sibling_page_id=old_leaf.right_sibling_page_id,  # inherit the old tail
+       slots=old_leaf.slots[3:],                               # upper half moves out
+   )
+   old_leaf.slots = old_leaf.slots[:3]                         # lower half stays
+   old_leaf.right_sibling_page_id = new_leaf_id                # point old → new
+   ```
+
+   d. **The promoted key** is `new_leaf.slots[0].key` — the smallest key in the new (right) leaf. For a leaf split, this key is *copied* up: it still exists in the leaf's slot list.
+
+   e. **Write both leaves:** `_write_page(page_1_id, old_leaf)` and `_write_page(new_leaf_id, new_leaf)`.
+
+   f. **Insert the promoted key into the parent.** This is where the `path` from `_find_leaf` comes in. Pop the last entry `(parent_page_id, child_index)` off the path. Read the parent: `parent = _read_page(parent_page_id)`. Insert a new slot into the parent's slot list:
+   ```python
+   parent.slots.insert(child_index + 1, InternalSlot(key=promoted_key, child_page_id=new_leaf_id))
+   ```
+   Why `child_index + 1`? Because `child_index` is the slot (or -1 for `leftmost_child_page_id`) that led to the old leaf. The new child goes immediately *after* that position in the parent's slot list. Then `_write_page(parent_page_id, parent)`.
+
+   **Special case — splitting the root leaf.** If the path is empty (the leaf *was* the root), there is no parent to insert into. Instead, create a brand new internal page to be the new root:
+   ```python
+   new_root_id = pager.allocate_page()
+   new_root = InternalPage(
+       leftmost_child_page_id=old_leaf_id,    # left half
+       slots=[InternalSlot(key=promoted_key, child_page_id=new_leaf_id)],  # right half
+   )
+   _write_page(new_root_id, new_root)
+   pager.update_meta(root_page_id=new_root_id)
+   ```
+
+   End state after splitting:
+   ```
+   Page 4 (internal, new root): leftmost_child_page_id=1
+                                slots=[InternalSlot("03", child_page_id=2)]
+   Page 1 (leaf): slots=[("01",v), ("02",v)]   right_sibling_page_id=2
+   Page 2 (leaf): slots=[("03",v), ("04",v), ("05",v)]   right_sibling_page_id=0
+   Meta: root_page_id=4
+   ```
+
+4. **Internal split propagation.** After inserting a promoted key into the parent in step 3f, the parent itself might overflow. Check with `_encoded_size_estimate(parent)`. If it overflows, split the internal page — the mechanics are similar to a leaf split, but with one critical asymmetry:
+
+   **How an internal split works, step by step:**
+
+   Starting state — internal page 4 is full after receiving a promoted key:
+   ```
+   Page 4 (internal): leftmost_child_page_id=1
+                      slots=[("10", child=2), ("20", child=3), ("30", child=5), ("40", child=6)]
+   ```
+
+   a. **Find the median.** Suppose the median is at index 2 (the slot `("20", child=3)`).
+
+   b. **The median is *removed* from both halves and promoted.** This is the key difference from leaf splits. In a leaf split, the promoted key is *copied* (it stays in the new right leaf). In an internal split, the median key is *moved* out — it does not appear in either resulting internal page.
+
+   c. **Build the two halves:**
+   ```python
+   # Left half keeps everything before the median.
+   # old_page.leftmost_child_page_id stays unchanged.
+   old_page.slots = old_page.slots[:2]   # [("10", child=2)]
+   # So left page has: leftmost=1, slots=[("10", child=2)]
+   # Its children are: 1, 2
+
+   # Right half gets everything after the median.
+   # The median's child_page_id becomes the new page's leftmost_child.
+   new_page_id = pager.allocate_page()
+   new_page = InternalPage(
+       leftmost_child_page_id=old_page.slots[median_idx].child_page_id,  # = 3
+       slots=old_page.slots[median_idx + 1:],  # [("30", child=5), ("40", child=6)]
+   )
+   # So right page has: leftmost=3, slots=[("30", child=5), ("40", child=6)]
+   # Its children are: 3, 5, 6
+   ```
+
+   d. **The promoted key** is the median's key (`"20"`), and the promoted child is `new_page_id`. Write both pages.
+
+   e. **Insert the promoted key into the grandparent** using the same logic as step 3f — pop the next entry off the path, insert `InternalSlot(promoted_key, new_page_id)` at the right position.
+
+   f. **If the path is exhausted**, you've split the root. Create a new root:
+   ```python
+   new_root_id = pager.allocate_page()
+   new_root = InternalPage(
+       leftmost_child_page_id=old_page_id,
+       slots=[InternalSlot(key=promoted_key, child_page_id=new_page_id)],
+   )
+   _write_page(new_root_id, new_root)
+   pager.update_meta(root_page_id=new_root_id)
+   ```
+
+   **Why "copy up" for leaves but "move up" for internals?** In a leaf, every key *is* the data — removing it from the leaf would lose it. In an internal page, keys are just separators — they're routing metadata, not data. Moving the median up to the parent is sufficient; keeping a copy in the child would create a redundant separator that wastes space and complicates traversal.
 
 5. **`scan(start, end, version_check)`.** Find the leaf containing `start` via a search-style walk that stops at leaf level. Iterate slots from there, yielding while the key is below `end`. When you run off the end of a leaf, move to `right_sibling_page_id` and continue. Call `version_check()` at the top of every step of the loop, *before* yielding.
 
 6. **`delete(key)` without rebalance.** Locate the slot, `slots.pop(i)`, encode, write. Return `True`. Don't worry about the half-full invariant yet.
 
-7. **Same-parent merge and redistribute.** After a delete, if the leaf's encoded size drops below `HALF_FULL_THRESHOLD * page_size_bytes`, find the immediate **same-parent** left and right siblings by looking at the parent's `slots` / `leftmost_child_page_id` (**not** via `right_sibling_page_id`, which can cross parent boundaries; merging requires same-parent siblings). If a sibling has spare bytes such that moving one record leaves both siblings ≥ 40% full, redistribute and update the parent's separator. Otherwise, merge: combine the two leaves into one, splice out the freed page id from the sibling chain, remove the corresponding separator from the parent. The freed page id *leaks* in iteration 3 (nothing is tracking freed pages yet); iteration 6 will introduce the freelist. The parent may now be under-full — recurse symmetrically.
+7. **Same-parent merge and redistribute.** After a delete, if the leaf's encoded size drops below `HALF_FULL_THRESHOLD * page_size_bytes`, the leaf is underful and needs rebalancing.
 
-8. **Internal merge propagation and root collapse.** Internal merges concatenate the two children plus a separator pulled down from the parent. If the root is left with only one child, collapse: `pager.update_meta(root_page_id=that_child)`.
+   **Finding same-parent siblings.** Use the `path` from `_find_leaf`. The last entry is `(parent_page_id, child_index)` — the parent page and which of its children led to our leaf. Read the parent, then find the leaf's immediate left and right siblings *within that parent*:
+
+   ```
+   Parent: leftmost_child_page_id=1, slots=[("10",child=2), ("20",child=3), ("30",child=5)]
+                                       idx=0              idx=1              idx=2
+   Children in order: 1,       2,       3,       5
+                     (lm)    (s[0])   (s[1])   (s[2])
+   ```
+
+   - If our leaf is `child=3` (the parent reached it via `slots[1]`, so `child_index=1`), its left sibling is `slots[0].child_page_id = 2` and its right sibling is `slots[2].child_page_id = 5`.
+   - If our leaf is `child=1` (reached via `leftmost_child_page_id`, so `child_index=-1`), it has no left sibling. Its right sibling is `slots[0].child_page_id = 2`.
+   - If our leaf is `child=5` (`child_index=2`, the last slot), it has no right sibling. Its left sibling is `slots[1].child_page_id = 3`.
+
+   **Important:** do **not** use `right_sibling_page_id` to find siblings for merging. That pointer can cross parent boundaries, and merging across parents would corrupt the tree.
+
+   **Try to redistribute first.** Read the sibling. If the sibling has enough slots that you can move one or more records from the sibling to the underful leaf and leave *both* pages ≥ 40% full, redistribute:
+
+   ```
+   Before redistribute (left sibling has spare capacity):
+     Page 2 (leaf): slots=[("10",v), ("11",v), ("12",v), ("13",v)]
+     Page 3 (leaf): slots=[("20",v)]                  ← underful after delete
+     Parent separator between them: "20" at slots[1]
+
+   Move the last slot from page 2 into the front of page 3:
+     Page 2 (leaf): slots=[("10",v), ("11",v), ("12",v)]
+     Page 3 (leaf): slots=[("13",v), ("20",v)]
+
+   Update the parent's separator to reflect the new boundary:
+     Parent slots[1].key = "13"    ← the new smallest key in page 3
+   ```
+
+   Write both leaves and the parent.
+
+   **If redistribution isn't possible, merge.** Combine the two leaves into one and remove the separator from the parent:
+
+   ```
+   Before merge:
+     Page 2 (leaf): slots=[("10",v)]          ← also small
+     Page 3 (leaf): slots=[("20",v)]          ← underful
+     Parent: leftmost=1, slots=[("10",child=2), ("20",child=3), ("30",child=5)]
+
+   Merge page 3 into page 2 (append right's slots to left's):
+     Page 2 (leaf): slots=[("10",v), ("20",v)]
+     Page 2's right_sibling_page_id = page 3's old right_sibling_page_id  ← splice out page 3
+
+   Remove the separator that pointed to the merged-away page (page 3) from the parent:
+     Parent: leftmost=1, slots=[("10",child=2), ("30",child=5)]
+     (The separator "20" is gone; page 2 now covers everything < "30".)
+
+   Page 3 is now unreachable. Its page id leaks in iteration 3; iteration 6's freelist will reclaim it.
+   ```
+
+   Write the surviving leaf and the parent. The parent may now be underful — recurse upward (step 8).
+
+8. **Internal merge propagation and root collapse.** When an internal page becomes underful after losing a separator in step 7, the same redistribute-or-merge logic applies, but with the same asymmetry as splits: the parent's separator is *pulled down* into the merge.
+
+   **Internal merge, step by step:**
+   ```
+   Before:
+     Grandparent: leftmost=4, slots=[("50",child=7)]
+     Page 4 (internal): leftmost=1, slots=[("10",child=2), ("30",child=5)]
+     Page 7 (internal): leftmost=8, slots=[("70",child=9)]      ← underful
+
+   The grandparent's separator between pages 4 and 7 is "50".
+
+   Merge page 7 into page 4:
+     1. Pull the separator "50" DOWN from the grandparent into page 4 as a new slot.
+        The child for this slot is page 7's leftmost_child_page_id (= 8).
+        Page 4 slots: [("10",child=2), ("30",child=5), ("50",child=8)]
+     2. Append all of page 7's slots to page 4:
+        Page 4 slots: [("10",child=2), ("30",child=5), ("50",child=8), ("70",child=9)]
+     3. Remove the separator "50" from the grandparent.
+        Grandparent: leftmost=4, slots=[]
+   ```
+
+   **Internal redistribute** works similarly: move a slot from the sibling, but route it *through* the parent's separator. Move the parent's separator down into the underful node, then move the sibling's edge slot up to replace the parent's separator.
+
+   **Root collapse.** After a merge, if the root is left with zero slots (an internal page with only `leftmost_child_page_id` and no separators), it has exactly one child. Collapse:
+   ```python
+   pager.update_meta(root_page_id=root.leftmost_child_page_id)
+   ```
+   The old root page leaks (iteration 6 reclaims it). The tree is now one level shorter.
 
 **Helper functions you'll want in `tree.py`:**
 

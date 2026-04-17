@@ -45,7 +45,7 @@ A successful v0 implementation:
 - Transactions (`begin` / `commit` / `abort`). Each `put` and `delete` is its own atomic, durable unit.
 - Secondary indexes, schemas, types beyond raw bytes.
 - Compression, encryption, replication.
-- Records larger than `page_size / 4`. Oversized records are rejected with `DBRecordTooLargeError`.
+- Records larger than `page_size / 5`. Oversized records are rejected with `DBRecordTooLargeError`.
 - Online schema or page-size changes.
 - Mutation-tolerant range cursors (deferred to v1; see Section 10).
 - Dual / ping-pong meta pages for additional torn-write protection.
@@ -222,7 +222,7 @@ The Pager's freelist head is `meta.freelist_head`. When a page is freed it is pu
 
 ### 4.3 Size limits
 
-- The maximum usable record size is approximately `page_size / 4`. The exact threshold, accounting for the 32-byte header and per-slot overhead, is computed by the implementation as `(page_size - header_size) / 4 - slot_size`. For `page_size = 4096` this is 1008 bytes; for `page_size = 256` it is 48 bytes. Records larger than this threshold are rejected with `DBRecordTooLargeError`. The bound guarantees that at least four records fit in an empty page, which keeps the half-full invariant achievable for arbitrary insertion patterns.
+- The maximum usable record size is approximately `page_size / 5`. The exact threshold, accounting for the 32-byte header and per-slot overhead, is computed by the implementation as `(page_size - header_size) / 5 - slot_size`. For `page_size = 4096` this is 806 bytes; for `page_size = 256` it is 38 bytes. Records larger than this threshold are rejected with `DBRecordTooLargeError`. The `/5` (rather than the more intuitive `/4`, which would also guarantee "four records fit in an empty page") keeps the maximum slot size below `0.2 * page_size + 24`. That bound is what makes the half-full invariant always achievable: with a tighter cap, split and merge-then-split can always find a partition where both halves land above the 40% threshold; at `/4`, extreme slot-size distributions can force an unbalanced split that leaves one half underfull.
 - The minimum supported `page_size` is 256 bytes. Below that, the threshold above degenerates and split decisions become awkward. The default `page_size` is 4096.
 
 ### 4.4 The WAL file
@@ -470,7 +470,7 @@ Parameters:
 db.put(key: bytes, value: bytes) -> None
 ```
 
-Insert or overwrite. Raises `ValueError` if `key` or `value` is not `bytes`. Raises `DBRecordTooLargeError` if the encoded record would exceed `page_size / 4`. Durable when this method returns: the WAL has been appended and fsynced. Bumps the tree's version counter.
+Insert or overwrite. Raises `ValueError` if `key` or `value` is not `bytes`. Raises `DBRecordTooLargeError` if the encoded record would exceed `page_size / 5`. Durable when this method returns: the WAL has been appended and fsynced. Bumps the tree's version counter.
 
 ```python
 db.get(key: bytes) -> bytes | None
@@ -694,7 +694,7 @@ Owns the data file. One instance per open DB. Reads and writes happen one page a
 |------------------|-------------|----------------------------------------------------------------|
 | `path`           | `Path`      | Absolute path to the data file.                                |
 | `page_size_bytes`| `int`       | Honoured from the on-disk meta page on reopen.                 |
-| `num_pages`      | `int`       | Current file size in pages.                                    |
+| `num_pages`      | `int`       | Current page count, derived from `meta.next_page_id`.          |
 
 **Methods:**
 
@@ -902,7 +902,7 @@ These are deliberately deferred. Each is large enough to be its own brainstormin
 
 1. **Mutation-tolerant range cursor.** Replace the version-check iterator with a key-based cursor that re-traverses from the root on each `next()` using the last yielded key. Allows mutations during iteration without raising. The trade is O(log N) per step instead of O(1).
 2. **Ping-pong meta pages.** Keep two meta pages and alternate between them on each checkpoint. On open, pick the one with the higher `last_checkpoint_lsn` whose CRC is valid. Survives torn writes to the meta page itself.
-3. **Overflow pages for oversized records.** Allow keys + values larger than `page_size / 4` by spilling values across linked overflow pages.
+3. **Overflow pages for oversized records.** Allow keys + values larger than `page_size / 5` by spilling values across linked overflow pages.
 4. **STEAL buffer-pool policy with UNDO logging.** Allow eviction of dirty pages between checkpoints. Requires writing UNDO records and a rollback mechanism. Unlocks much larger working sets but adds significant complexity.
 5. **Transactions.** `db.begin() / commit() / abort()` with at least read-committed semantics.
 6. **Concurrency.** Page-level latches plus a top-level reader-writer lock, or jump straight to MVCC.

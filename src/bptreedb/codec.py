@@ -307,3 +307,31 @@ def decode_page(data: bytes) -> InternalPage | LeafPage:
             )
         case _:
             raise ValueError(f"Unknown page type {page_type}")
+
+
+def calculate_slot_size(slot: LeafSlot | InternalSlot, include_meta: bool = False) -> int:
+    base_size = _SLOT_ENTRY.size if include_meta else 0
+    match slot:
+        case InternalSlot():
+            return base_size + _LENGTH_FIELD.size + len(slot.key) + _PAGE_ID_FIELD.size
+        case LeafSlot():
+            return base_size + _LENGTH_FIELD.size * 2 + len(slot.key) + len(slot.value)
+        case _:
+            raise ValueError(f"Unknown slot type: {type(slot)}")
+
+
+def calculate_page_size(page: InternalPage | LeafPage) -> int:
+    encoded_page_size = _PAGE_HEADER.size
+    for slot in page.slots:
+        encoded_page_size += calculate_slot_size(slot, include_meta=True)
+    return encoded_page_size
+
+
+def calculate_leaf_record_size(key: bytes, value: bytes) -> int:
+    return _LENGTH_FIELD.size * 2 + len(key) + len(value)
+
+
+def get_max_leaf_record_size(page_size_bytes: int) -> int:
+    # The 20% cap (not 25%) ensures that no single slot is large enough to force a split into
+    # underpopulated half-pages which are impossible to balance without introducing new techniques.
+    return (page_size_bytes - _PAGE_HEADER.size) // 5 - _SLOT_ENTRY.size
