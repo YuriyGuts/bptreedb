@@ -5,6 +5,7 @@ import pytest
 
 from bptreedb.db import DB
 from bptreedb.exceptions import DBClosedError
+from bptreedb.exceptions import DBConcurrentPageModificationError
 
 
 @pytest.fixture
@@ -147,6 +148,103 @@ def test_scan_inclusive_exclusive_bounded(db):
     assert list(db.scan(b"baa", b"foo")) == [(b"baz", b"qux")]
     assert list(db.scan(b"bba", b"fop")) == [(b"foo", b"bar")]
     assert list(db.scan(b"foo", b"foo")) == []
+
+
+def test_scan_forbids_put_before_iter(db):
+    # GIVEN an empty DB
+    # WHEN initiating the scan query
+    it = db.scan(None, None)
+    # WHEN modifying the DB concurrently before the scan is exhausted
+    db.put(b"foo", b"bar")
+    # THEN it should raise
+    with pytest.raises(DBConcurrentPageModificationError):
+        next(it)
+
+
+def test_scan_forbids_put_during_iter(db):
+    # GIVEN a DB with two keys
+    db.put(b"foo", b"bar")
+    db.put(b"baz", b"qux")
+
+    # WHEN initiating the scan query and consuming it partially
+    it = db.scan(None, None)
+    next(it)
+    # WHEN modifying the DB concurrently before the scan is exhausted
+    db.put(b"foo", b"bar")
+    # THEN it should raise
+    with pytest.raises(DBConcurrentPageModificationError):
+        next(it)
+
+
+def test_scan_allows_invalid_put_during_iter(db):
+    # GIVEN a DB with two keys
+    db.put(b"foo", b"bar")
+    db.put(b"baz", b"qux")
+
+    # WHEN initiating the scan query and consuming it partially
+    it = db.scan(None, None)
+    assert next(it) == (b"baz", b"qux")
+    # WHEN running an invalid put command
+    with pytest.raises(TypeError):
+        db.put(42, 43)
+    # THEN it should allow further iteration because the DB has not changed
+    assert next(it) == (b"foo", b"bar")
+
+
+def test_scan_forbids_delete_before_iter(db):
+    # GIVEN a DB with two keys
+    db.put(b"foo", b"bar")
+    db.put(b"baz", b"qux")
+    # WHEN initiating the scan query
+    it = db.scan(None, None)
+    # WHEN modifying the DB concurrently before the scan is exhausted
+    db.delete(b"foo")
+    # THEN it should raise
+    with pytest.raises(DBConcurrentPageModificationError):
+        next(it)
+
+
+def test_scan_forbids_delete_during_iter(db):
+    # GIVEN a DB with two keys
+    db.put(b"foo", b"bar")
+    db.put(b"baz", b"qux")
+
+    # WHEN initiating the scan query and consuming it partially
+    it = db.scan(None, None)
+    next(it)
+    # WHEN modifying the DB concurrently before the scan is exhausted
+    db.delete(b"foo")
+    # THEN it should raise
+    with pytest.raises(DBConcurrentPageModificationError):
+        next(it)
+
+
+def test_scan_allows_missing_delete_during_iter(db):
+    # GIVEN a DB with two keys
+    db.put(b"foo", b"bar")
+    db.put(b"baz", b"qux")
+
+    # WHEN initiating the scan query and consuming it partially
+    it = db.scan(None, None)
+    assert next(it) == (b"baz", b"qux")
+    # WHEN modifying the DB concurrently before the scan is exhausted
+    assert db.delete(b"corge") is False
+    # THEN it should allow further iteration because the DB has not changed
+    assert next(it) == (b"foo", b"bar")
+
+
+def test_scan_allows_get_during_iter(db):
+    # GIVEN a DB with two keys
+    db.put(b"foo", b"bar")
+    db.put(b"baz", b"qux")
+
+    # WHEN initiating the scan query and consuming it partially
+    it = db.scan(None, None)
+    assert next(it) == (b"baz", b"qux")
+    # WHEN searching the DB concurrently before the scan is exhausted
+    assert db.get(b"foo") == b"bar"
+    # THEN it should allow further iteration because search does not mutate the DB
+    assert next(it) == (b"foo", b"bar")
 
 
 def test_all_keys_and_values_must_be_bytes(db):
