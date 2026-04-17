@@ -6,8 +6,6 @@ from struct import Struct
 from typing import IO
 from typing import Any
 
-from bptreedb.entities import DATA_FILE_MAGIC_PREFIX
-from bptreedb.entities import DATA_FILE_VERSION
 from bptreedb.entities import InternalPage
 from bptreedb.entities import InternalSlot
 from bptreedb.entities import LeafPage
@@ -30,6 +28,10 @@ _META_PAGE_NO_CRC = Struct("<8sIIQQ")
 _PAGE_HEADER = Struct("<B3sIIIQ")
 _SLOT_ENTRY = Struct("<II")
 
+DATA_FILE_MAGIC_PREFIX = b"BPTREEDB"
+DATA_FILE_VERSION = 1
+MIN_PAGE_SIZE = _META_PAGE_NO_CRC.size + _CRC32_FIELD.size
+
 
 class BufferReader:
     def __init__(self, data: bytes) -> None:
@@ -43,9 +45,9 @@ class BufferReader:
         return Struct(spec)
 
     def read_struct(self, spec: str | Struct) -> tuple:
-        s = self._as_struct(spec)
-        value = s.unpack_from(self.data, self.offset)
-        self.offset += s.size
+        st = self._as_struct(spec)
+        value = st.unpack_from(self.data, self.offset)
+        self.offset += st.size
         return value
 
     def read_bytes(self, length: int) -> bytes:
@@ -69,10 +71,10 @@ class BufferWriter:
         return Struct(spec)
 
     def write_struct(self, spec: str | Struct, *values: Any) -> None:  # noqa: ANN401
-        s = self._as_struct(spec)
+        st = self._as_struct(spec)
         offset = len(self._buffer)
-        self._buffer.extend(b"\x00" * s.size)
-        s.pack_into(self._buffer, offset, *values)
+        self._buffer.extend(bytes(st.size))
+        st.pack_into(self._buffer, offset, *values)
 
     def write_bytes(
         self,
@@ -111,17 +113,6 @@ class BufferWriter:
         return len(self._buffer)
 
 
-def verify_crc32(data: bytes) -> None:
-    actual_crc32 = zlib.crc32(data[: -_CRC32_FIELD.size])
-    expected_crc32 = _CRC32_FIELD.unpack(data[-_CRC32_FIELD.size :])[0]
-    if actual_crc32 != expected_crc32:
-        raise DBChecksumError(expected_crc32, actual_crc32)
-
-
-def max_record_body_size(page_size_bytes: int) -> int:
-    return (page_size_bytes - 24) // 4 - 8
-
-
 class WALOperationType(IntEnum):
     PUT = 0x01
     DELETE = 0x02
@@ -130,6 +121,13 @@ class WALOperationType(IntEnum):
 class PageType(IntEnum):
     INTERNAL = 0x01
     LEAF = 0x02
+
+
+def verify_crc32(data: bytes) -> None:
+    actual_crc32 = zlib.crc32(data[: -_CRC32_FIELD.size])
+    expected_crc32 = _CRC32_FIELD.unpack(data[-_CRC32_FIELD.size :])[0]
+    if actual_crc32 != expected_crc32:
+        raise DBChecksumError(expected_crc32, actual_crc32)
 
 
 def encode_wal_record(record: WALRecord) -> bytes:
@@ -218,8 +216,6 @@ def decode_meta_page(data: bytes) -> MetaPage:
     reader = BufferReader(data)
     unpacked = reader.read_struct(_META_PAGE_NO_CRC)
     return MetaPage(
-        magic=unpacked[0],
-        version=unpacked[1],
         page_size_bytes=unpacked[2],
         root_page_id=unpacked[3],
         next_page_id=unpacked[4],

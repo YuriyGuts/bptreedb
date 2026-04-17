@@ -7,8 +7,6 @@ from bptreedb.codec import decode_wal_record
 from bptreedb.codec import encode_meta_page
 from bptreedb.codec import encode_page
 from bptreedb.codec import encode_wal_record
-from bptreedb.entities import DATA_FILE_MAGIC_PREFIX
-from bptreedb.entities import DATA_FILE_VERSION
 from bptreedb.entities import InternalPage
 from bptreedb.entities import InternalSlot
 from bptreedb.entities import LeafPage
@@ -133,8 +131,6 @@ def test_decode_next_wal_record_from_file_torn_at_payload(make_wal):
 
 def test_meta_page_encode_decode():
     page = MetaPage(
-        magic=DATA_FILE_MAGIC_PREFIX,
-        version=DATA_FILE_VERSION,
         page_size_bytes=256,
         root_page_id=12345,
         next_page_id=67890,

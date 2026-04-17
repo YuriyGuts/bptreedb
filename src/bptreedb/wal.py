@@ -33,7 +33,7 @@ class WAL:
 
     def close(self) -> None:
         if self._fd is not None:
-            self._fsync()
+            fsync_file(self._fd)
             self._fd.close()
             self._fd = None
 
@@ -70,12 +70,8 @@ class WAL:
         assert self._fd is not None
         self.current_lsn = record.lsn
         self._fd.write(encode_wal_record(record))
-        self._fsync()
-        return record.lsn
-
-    def _fsync(self) -> None:
-        assert self._fd is not None
         fsync_file(self._fd)
+        return record.lsn
 
     def replay(self, callback: Callable[[WALRecord], None]) -> None:
         assert self._fd is not None
@@ -108,4 +104,4 @@ class WAL:
         # Truncate the file after the last known good record.
         self._fd.seek(last_good_file_pos)
         self._fd.truncate()
-        self._fsync()
+        fsync_file(self._fd)

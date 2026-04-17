@@ -1,7 +1,7 @@
-from dataclasses import dataclass
+from __future__ import annotations
 
-DATA_FILE_MAGIC_PREFIX = b"BPTREEDB"
-DATA_FILE_VERSION = 1
+import copy
+from dataclasses import dataclass
 
 
 @dataclass
@@ -22,12 +22,12 @@ class WALDeleteRecord(WALRecord):
 
 @dataclass
 class MetaPage:
-    # TODO: do these two fields belong here?
-    magic: bytes
-    version: int
     page_size_bytes: int
     root_page_id: int
     next_page_id: int
+
+    def copy(self) -> MetaPage:
+        return copy.deepcopy(self)
 
 
 @dataclass
@@ -41,6 +41,9 @@ class InternalPage:
     leftmost_child_page_id: int
     slots: list[InternalSlot]
 
+    def copy(self) -> InternalPage:
+        return copy.deepcopy(self)
+
 
 @dataclass
 class LeafSlot:
@@ -52,3 +55,6 @@ class LeafSlot:
 class LeafPage:
     right_sibling_page_id: int
     slots: list[LeafSlot]
+
+    def copy(self) -> LeafPage:
+        return copy.deepcopy(self)
