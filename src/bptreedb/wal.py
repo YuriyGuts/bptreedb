@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import IO
@@ -15,10 +16,25 @@ from bptreedb.fs import fsync_directory
 from bptreedb.fs import fsync_file
 
 
+@dataclass
+class WALStats:
+    records_appended: int = 0
+    bytes_appended: int = 0
+    fsyncs: int = 0
+    records_replayed: int = 0
+
+    def reset(self) -> None:
+        self.records_appended = 0
+        self.bytes_appended = 0
+        self.fsyncs = 0
+        self.records_replayed = 0
+
+
 class WAL:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.current_lsn = 0
+        self.stats = WALStats()
         self._fd: IO[bytes] | None = None
 
     def open(self) -> None:
@@ -34,6 +50,7 @@ class WAL:
     def close(self) -> None:
         if self._fd is not None:
             fsync_file(self._fd)
+            self.stats.fsyncs += 1
             self._fd.close()
             self._fd = None
 
@@ -68,9 +85,13 @@ class WAL:
 
     def _append(self, record: WALRecord) -> int:
         assert self._fd is not None
+        encoded = encode_wal_record(record)
         self.current_lsn = record.lsn
-        self._fd.write(encode_wal_record(record))
+        self._fd.write(encoded)
         fsync_file(self._fd)
+        self.stats.records_appended += 1
+        self.stats.bytes_appended += len(encoded)
+        self.stats.fsyncs += 1
         return record.lsn
 
     def replay(self, callback: Callable[[WALRecord], None]) -> None:
@@ -95,6 +116,7 @@ class WAL:
 
                 last_good_file_pos = self._fd.tell()
                 self.current_lsn = record.lsn
+                self.stats.records_replayed += 1
                 callback(record)
             except DBChecksumError:
                 already_encountered_broken_record = True
@@ -105,3 +127,4 @@ class WAL:
         self._fd.seek(last_good_file_pos)
         self._fd.truncate()
         fsync_file(self._fd)
+        self.stats.fsyncs += 1

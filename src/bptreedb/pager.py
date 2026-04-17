@@ -1,4 +1,5 @@
 import io
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import IO
@@ -19,12 +20,29 @@ META_PAGE_ID = 0
 DEFAULT_ROOT_PAGE_ID = 1
 
 
+@dataclass
+class PagerStats:
+    page_reads: int = 0
+    page_writes: int = 0
+    pages_allocated: int = 0
+    meta_flushes: int = 0
+    fsyncs: int = 0
+
+    def reset(self) -> None:
+        self.page_reads = 0
+        self.page_writes = 0
+        self.pages_allocated = 0
+        self.meta_flushes = 0
+        self.fsyncs = 0
+
+
 class Pager:
     def __init__(self, path: Path, *, page_size_bytes: int) -> None:
         if page_size_bytes < MIN_PAGE_SIZE:
             raise ValueError(f"Page size must be at least {MIN_PAGE_SIZE} bytes")
         self.path = path
         self.page_size_bytes = page_size_bytes
+        self.stats = PagerStats()
         self._file: IO[bytes] | None = None
         self._meta_page: MetaPage | None = None
         self._is_meta_dirty = False
@@ -96,16 +114,19 @@ class Pager:
         data = self._file.read(self.page_size_bytes)
         if page_id != META_PAGE_ID and len(data) != self.page_size_bytes:
             raise DBCorruptedError(f"Unexpected end of file while reading page {page_id}")
+        self.stats.page_reads += 1
         return data
 
     def write_page(self, page_id: int, data: bytes) -> None:
         assert self._file is not None
         self._file.seek(page_id * self.page_size_bytes)
         self._file.write(data)
+        self.stats.page_writes += 1
 
     def fsync(self) -> None:
         assert self._file is not None
         fsync_file(self._file)
+        self.stats.fsyncs += 1
 
     def get_meta(self) -> MetaPage:
         assert self._meta_page is not None
@@ -121,10 +142,12 @@ class Pager:
         assert self._meta_page is not None
         self.write_page(META_PAGE_ID, encode_meta_page(self._meta_page))
         self._is_meta_dirty = False
+        self.stats.meta_flushes += 1
 
     def allocate_page(self) -> int:
         assert self._meta_page is not None
         page_id = self._meta_page.next_page_id
         self._extend_file_by_one_page()
         self.update_meta(next_page_id=page_id + 1)
+        self.stats.pages_allocated += 1
         return page_id

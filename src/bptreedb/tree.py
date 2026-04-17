@@ -34,11 +34,32 @@ class LeafSearchResult:
     path: list[PathItem]
 
 
+@dataclass
+class TreeStats:
+    leaf_splits: int = 0
+    internal_splits: int = 0
+    leaf_merges: int = 0
+    internal_merges: int = 0
+    leaf_redistributes: int = 0
+    internal_redistributes: int = 0
+    root_collapses: int = 0
+
+    def reset(self) -> None:
+        self.leaf_splits = 0
+        self.internal_splits = 0
+        self.leaf_merges = 0
+        self.internal_merges = 0
+        self.leaf_redistributes = 0
+        self.internal_redistributes = 0
+        self.root_collapses = 0
+
+
 class BPlusTree:
     HALF_FULL_THRESHOLD = 0.4
 
     def __init__(self, pager: Pager) -> None:
         self.pager = pager
+        self.stats = TreeStats()
 
     @property
     def page_size_bytes(self) -> int:
@@ -227,6 +248,7 @@ class BPlusTree:
                 promoted_key = new_sibling_page.slots[0].key
                 page.slots = page.slots[:split_slot_idx]
                 page.right_sibling_page_id = new_sibling_page_id
+                self.stats.leaf_splits += 1
             case InternalPage():
                 # Allocate a sibling internal page, promote the median,
                 # move everything after the median to the new page.
@@ -237,6 +259,7 @@ class BPlusTree:
                 )
                 promoted_key = page.slots[split_slot_idx].key
                 page.slots = page.slots[:split_slot_idx]
+                self.stats.internal_splits += 1
 
             case _:
                 raise ValueError(f"Unexpected page type: {type(page).__name__}")
@@ -343,7 +366,7 @@ class BPlusTree:
         )
         return sibling_info
 
-    def _redistribute_or_merge_page(  # noqa: PLR0912
+    def _redistribute_or_merge_page(  # noqa: PLR0912, PLR0915
         self,
         page_id: int,
         parent_page_id: int | None,
@@ -372,6 +395,11 @@ class BPlusTree:
             ):
                 self._write_page(page_id, page)
                 self._write_page(sibling_page_id, sibling_page)
+
+                if isinstance(page, LeafPage):
+                    self.stats.leaf_redistributes += 1
+                else:
+                    self.stats.internal_redistributes += 1
 
                 # Redistribution overwrote a parent separator with a key of possibly different
                 # length, which may have over/underpopulated the parent page.
@@ -434,9 +462,15 @@ class BPlusTree:
             self._write_page(merge_left_page_id, merge_left_page)
             self._write_page(parent_page_id, parent_page)
 
+            if isinstance(merge_left_page, LeafPage):
+                self.stats.leaf_merges += 1
+            else:
+                self.stats.internal_merges += 1
+
             # If we've just merged the only remaining leaves in the tree, collapse the root.
             if not parent_page.slots and parent_page_id == self.root_page_id:
                 self.pager.update_meta(root_page_id=parent_page.leftmost_child_page_id)
+                self.stats.root_collapses += 1
                 return None
 
             return parent_page_id, parent_page

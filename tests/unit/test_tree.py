@@ -1034,3 +1034,29 @@ def test_invariants_hold_at_4kb_with_mixed_key_lengths(tmp_path):
         # THEN every surviving key should still read back the value the oracle expects
         for key, expected in oracle.items():
             assert tree.search(key) == expected
+
+
+def test_stats_counters_record_splits_and_reset(empty_tree):
+    # GIVEN a fresh empty tree
+    tree = empty_tree
+    assert tree.stats.leaf_splits == 0
+    assert tree.stats.internal_splits == 0
+
+    # WHEN inserting enough keys to force at least one leaf split on a 256-byte page
+    for i in range(100):
+        tree.insert(f"key-{i:04d}".encode(), b"v" * 16)
+
+    # THEN the split counter should have advanced
+    assert tree.stats.leaf_splits >= 1
+
+    # WHEN resetting the stats
+    tree.stats.reset()
+
+    # THEN every field should be back to zero
+    assert tree.stats.leaf_splits == 0
+    assert tree.stats.internal_splits == 0
+    assert tree.stats.leaf_merges == 0
+    assert tree.stats.internal_merges == 0
+    assert tree.stats.leaf_redistributes == 0
+    assert tree.stats.internal_redistributes == 0
+    assert tree.stats.root_collapses == 0
