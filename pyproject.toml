@@ -62,6 +62,7 @@ exclude = ["tests/"]
 dev = [
     "hypothesis>=6.151.11",
     "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
     "ruff>=0.15.9",
     "ty>=0.0.29",
 ]
