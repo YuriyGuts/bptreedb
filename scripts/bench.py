@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
 
+from bptreedb.cache import BufferPoolStats
 from bptreedb.codec import calculate_page_size
 from bptreedb.db import DB
 from bptreedb.db import PAGER_FILENAME
@@ -81,6 +82,7 @@ class WorkloadResult:
     pager_stats: PagerStats = field(default_factory=PagerStats)
     tree_stats: TreeStats = field(default_factory=TreeStats)
     wal_stats: WALStats = field(default_factory=WALStats)
+    buffer_pool_stats: BufferPoolStats = field(default_factory=BufferPoolStats)
     data_file_bytes: int = 0
     wal_file_bytes: int = 0
     tree_shape: TreeShape = field(default_factory=lambda: TreeShape(0, 0, 0, 0.0))
@@ -205,6 +207,7 @@ def _reset_stats(db: DB) -> None:
     db.pager.stats.reset()
     db.tree.stats.reset()
     db.wal.stats.reset()
+    db.buffer_pool.stats.reset()
 
 
 def _run_mixed_rw(
@@ -353,9 +356,14 @@ def measure(
         wall = time.perf_counter() - t0
 
         tree_shape = _snapshot_tree_shape(db)
+        # Flush before snapshotting so close-time page writes (which the buffer pool defers
+        # to `flush_all`) are reflected in `pager_stats.page_writes`. Otherwise, `write_amp`
+        # would dramatically undercount disk traffic for any workload that relies on the cache.
+        db.buffer_pool.flush_all()
         pager_stats = PagerStats(**asdict(db.pager.stats))
         tree_stats = TreeStats(**asdict(db.tree.stats))
         wal_stats = WALStats(**asdict(db.wal.stats))
+        buffer_pool_stats = BufferPoolStats(**asdict(db.buffer_pool.stats))
     finally:
         db.close()
 
@@ -373,6 +381,7 @@ def measure(
         pager_stats=pager_stats,
         tree_stats=tree_stats,
         wal_stats=wal_stats,
+        buffer_pool_stats=buffer_pool_stats,
         data_file_bytes=data_file_bytes,
         wal_file_bytes=wal_file_bytes,
         tree_shape=tree_shape,
@@ -404,6 +413,14 @@ def _write_amplification(result: WorkloadResult) -> str:
     )
     ratio = disk_bytes / result.user_bytes_written
     return f"{ratio:.2f}x"
+
+
+def _cache_hit_ratio(result: WorkloadResult) -> str:
+    stats = result.buffer_pool_stats
+    total = stats.cache_hits + stats.cache_misses
+    if total == 0:
+        return "n/a"
+    return f"{100.0 * stats.cache_hits / total:.1f}%"
 
 
 def render_text(result: WorkloadResult) -> str:
@@ -461,6 +478,14 @@ def render_text(result: WorkloadResult) -> str:
         f"  meta flushes:        {result.pager_stats.meta_flushes:>14,}",
         f"  fsyncs:              {result.pager_stats.fsyncs:>14,}",
         "",
+        "Buffer pool counters:",
+        f"  cache hits:          {result.buffer_pool_stats.cache_hits:>14,}",
+        f"  cache misses:        {result.buffer_pool_stats.cache_misses:>14,}",
+        f"  hit ratio:           {_cache_hit_ratio(result):>14}",
+        f"  evictions:           {result.buffer_pool_stats.evictions:>14,}",
+        f"  flushes:             {result.buffer_pool_stats.flushes:>14,}",
+        f"  dirty pages flushed: {result.buffer_pool_stats.dirty_pages_flushed:>14,}",
+        "",
         "Tree counters:",
         f"  leaf splits:         {result.tree_stats.leaf_splits:>14,}",
         f"  internal splits:     {result.tree_stats.internal_splits:>14,}",
@@ -507,6 +532,10 @@ def render_json(result: WorkloadResult) -> dict:
         "pager_stats": asdict(result.pager_stats),
         "tree_stats": asdict(result.tree_stats),
         "wal_stats": asdict(result.wal_stats),
+        "buffer_pool_stats": {
+            **asdict(result.buffer_pool_stats),
+            "hit_ratio": _cache_hit_ratio(result),
+        },
     }
 
 

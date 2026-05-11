@@ -15,10 +15,27 @@ class CachedPage:
     is_dirty: bool
 
 
+@dataclass
+class BufferPoolStats:
+    cache_hits: int = 0
+    cache_misses: int = 0
+    evictions: int = 0
+    flushes: int = 0
+    dirty_pages_flushed: int = 0
+
+    def reset(self) -> None:
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.evictions = 0
+        self.flushes = 0
+        self.dirty_pages_flushed = 0
+
+
 class BufferPool:
     def __init__(self, pager: Pager, capacity_pages: int) -> None:
         self.pager = pager
         self.capacity_pages = capacity_pages
+        self.stats = BufferPoolStats()
         self._cache: OrderedDict[int, CachedPage] = OrderedDict()
 
     @property
@@ -29,6 +46,7 @@ class BufferPool:
         # Cache hit.
         if page_id in self._cache:
             self._cache.move_to_end(page_id)
+            self.stats.cache_hits += 1
             return self._cache[page_id].page
 
         # Cache miss, capacity full.
@@ -37,6 +55,7 @@ class BufferPool:
         # Cache miss, below capacity.
         page = decode_page(self.pager.read_page(page_id))
         self._cache[page_id] = CachedPage(page=page, is_dirty=False)
+        self.stats.cache_misses += 1
         return page
 
     def insert(self, page_id: int, page: LeafPage | InternalPage, lsn: int) -> None:
@@ -51,12 +70,14 @@ class BufferPool:
         cached_page.page.last_modified_lsn = max(cached_page.page.last_modified_lsn, lsn)
 
     def flush_all(self) -> None:
+        self.stats.flushes += 1
         for page_id, cached_page in self._cache.items():
             if cached_page.is_dirty:
                 self.pager.write_page(
                     page_id, encode_page(cached_page.page, self.pager.page_size_bytes)
                 )
                 cached_page.is_dirty = False
+                self.stats.dirty_pages_flushed += 1
 
     def get_dirty_page_ids(self) -> list[int]:
         result = [page_id for page_id, cached_page in self._cache.items() if cached_page.is_dirty]
@@ -74,3 +95,4 @@ class BufferPool:
                 raise DBBufferPoolOverflowError() from None
 
             del self._cache[page_id_to_evict]
+            self.stats.evictions += 1
