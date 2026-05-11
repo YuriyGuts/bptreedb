@@ -578,7 +578,7 @@ Suggested commit: `feat(pager): paged data file with meta page and bump-allocati
 
 A new module: `tree.py`. A new test file: `tests/unit/test_tree.py`. A new `_debug.py` with the invariant checker.
 
-The `BTree` class takes a `Pager` and exposes the algorithms. It does not know about WAL or recovery; it works purely in terms of page reads, page writes, and the meta page's `root_page_id`. In iteration 3 it asks the pager directly for pages; in iteration 4 you will thread the buffer pool in instead, and most of the tree code will be unchanged because a buffer-pool `get` returns the same kind of dataclass that `codec.decode_page` returns.
+The `BTree` class takes a `Pager` and exposes the algorithms. It does not know about WAL or recovery; it works purely in terms of page reads, page writes, and the meta page's `root_page_id`. In iteration 3 it asks the pager directly for pages; in iteration 4 you will add a buffer pool *alongside* the pager — the tree will route page reads and writes through the pool, but it still needs the pager for meta operations (`get_meta`, `update_meta`, `allocate_page`), which the pool does not handle. Most of the tree code is unchanged in iteration 4 because a buffer-pool `get` returns the same kind of dataclass that `codec.decode_page` returns.
 
 #### How the tree, pager, and codec interact
 
@@ -1013,6 +1013,8 @@ A new module: `cache.py`. A new test file: `tests/unit/test_cache.py`. Modificat
 
 In this iteration the rule is automatically satisfied because every `put` calls `wal.append + wal.fsync` *before* `tree.insert`, so by the time the tree calls `mark_dirty(page_id, lsn)`, the WAL record at `lsn` has already been fsynced. The LSN field therefore doesn't *do* anything observable in iteration 4 — it's bookkeeping. It earns its place in iteration 5 as the checkpoint cursor, and would earn a second role in a hypothetical iteration 7 that switched to a STEAL policy.
 
+**Note on what the buffer pool does *not* replace.** The pool caches `LeafPage` and `InternalPage` dataclasses — tree pages. The meta page is *not* buffer-pooled: it remains owned by the `Pager`, with its own in-memory `MetaPage` dataclass and its own `_meta_dirty` flag (described in iteration 3). The `BTree` therefore holds **both** a `Pager` reference and a `BufferPool` reference in iteration 4: it goes through the pool for tree page reads and writes, and continues to call the pager directly for `allocate_page`, `get_meta`, and `update_meta`. Root splits and root collapses update `root_page_id` via `self.pager.update_meta(root_page_id=...)` exactly as in iteration 3.
+
 #### The `BufferPool` class
 
 The buffer pool caches *decoded* `LeafPage` / `InternalPage` dataclasses, not raw bytes. On a miss it calls `pager.read_page` and then `codec.decode_page`. On `flush_all` it calls `codec.encode_page` and then `pager.write_page`. This is the whole point of the entities/codec split: the pool holds objects the tree can mutate directly, and only crosses the byte boundary at flush time.
@@ -1023,20 +1025,120 @@ The buffer pool caches *decoded* `LeafPage` / `InternalPage` dataclasses, not ra
 | `capacity_pages` | attribute | `int` | Maximum number of pages held in memory. |
 | `dirty_count` | property | `int` | Number of dirty pages currently pinned. |
 | `get` | method | `get(page_id: int) -> LeafPage \| InternalPage` | Cache hit → move to MRU, return the cached dataclass. Miss → `pager.read_page`, `codec.decode_page`, insert at MRU, evict the LRU *clean* entry if at capacity. If the pool is full and every page is dirty, raise `BufferPoolFull`. |
+| `insert_new_page` | method | `insert_new_page(page_id: int, page: LeafPage \| InternalPage, lsn: int) -> None` | Register a freshly-allocated page in the cache. `page_id` must come from `pager.allocate_page()` and must not already be in the cache. Insert at MRU with `dirty=True` and set `page.last_modified_lsn = lsn`. Evict the LRU clean entry first if at capacity; raise `BufferPoolFull` if every entry is dirty. Does *not* call `pager.read_page` — the disk bytes are zero-filled and would not decode. |
 | `mark_dirty` | method | `mark_dirty(page_id: int, lsn: int) -> None` | Set the cached entry's `dirty=True` flag and update its page's `last_modified_lsn = max(current, lsn)`. |
 | `flush_all` | method | `flush_all() -> None` | For every dirty entry: `codec.encode_page(page, page_size_bytes)` and `pager.write_page`. Clear the dirty flag. Does not fsync. |
 | `dirty_page_ids` | method | `dirty_page_ids() -> list[int]` | For tests and for the auto-checkpoint trigger in iteration 5. |
 
 Internally, each cached entry is a tiny record carrying `(page, dirty: bool)`. Use an `OrderedDict` and `move_to_end` to implement LRU, since `last_modified_lsn` now lives on the page dataclass itself.
 
+#### Bring the buffer pool to life in this order
+
+The buffer pool is a single `OrderedDict` plus a small set of rules. Each cached entry is:
+
+```python
+@dataclass
+class CachedPage:
+    page: LeafPage | InternalPage
+    dirty: bool
+```
+
+The dict is `self._cache: OrderedDict[int, CachedPage]`, used by the convention **leftmost entry is the LRU, rightmost is the MRU**. Every method below maintains that ordering by inserting and promoting to the right end and only evicting from the left.
+
+This is a **NO-STEAL** buffer pool: dirty pages are *pinned* in memory until `flush_all` writes them out. Eviction itself never calls the pager — clean means "on-disk bytes already match the in-memory copy", so dropping a clean entry is free. The WAL ordering rule mentioned in *Why `last_modified_lsn` earns its place now* is satisfied trivially as a consequence: nothing in this iteration writes a dirty data page to the pager except `flush_all`, and `flush_all` is only called from `close()` and (in iteration 5) the checkpoint.
+
+1. **`get(page_id)` — cache hit.** `page_id in self._cache`. Call `self._cache.move_to_end(page_id)` to promote the entry to the MRU end, then return `self._cache[page_id].page`. The `move_to_end` is what makes the policy LRU rather than FIFO: every read counts as a use.
+
+2. **`get(page_id)` — cache miss, room available.** `page_id not in self._cache` and `len(self._cache) < self.capacity_pages`. Read the page through the pager and decode it:
+
+   ```python
+   buf = self.pager.read_page(page_id)
+   page = codec.decode_page(buf)
+   self._cache[page_id] = CachedPage(page=page, dirty=False)
+   return page
+   ```
+
+   The fresh entry lands at the MRU end automatically because `OrderedDict` inserts at the right.
+
+3. **`get(page_id)` — cache miss, at capacity.** Before inserting, evict the **leftmost clean** entry. Iterate `self._cache.items()` from the left; the first entry whose `dirty` is `False` is the victim, `del self._cache[victim_id]`. Then load and insert the new page exactly as in step 2.
+
+   If the scan finishes without finding a clean entry — every page in the pool is dirty — raise `BufferPoolFull`. In iteration 4 this is a real failure mode if the dirty working set exceeds capacity; iteration 5's auto-checkpoint trigger keeps it from happening in practice by flushing before the pool fills.
+
+   Worked example with capacity 3:
+
+   ```
+   State:                  [page=1 clean, page=2 dirty, page=3 clean]
+                            (LRU end →)                          (← MRU end)
+
+   Call get(page_id=4):
+     pool is full → scan from the left for the first clean entry.
+     page 1 is clean → page 1 is the victim. del self._cache[1].
+
+   State after eviction:   [page=2 dirty, page=3 clean]
+
+   Load page 4 from pager, decode, insert.
+
+   State after insert:     [page=2 dirty, page=3 clean, page=4 clean]
+   ```
+
+   Note that page 2 stayed in the pool even though it was older than page 3, because it was dirty. That's the pinning rule in action.
+
+4. **`insert_new_page(page_id, page, lsn)`.** Called by the tree after `pager.allocate_page()` returns a fresh page id during a split, redistribute, merge, or root creation. The pager extends the file with a zero-filled page at the new id, so a normal `get(new_id)` would fail at `codec.decode_page` — zero bytes are not a valid page. Instead, the tree constructs the dataclass in memory and hands it to the pool directly:
+
+   ```python
+   new_leaf_id = self.pager.allocate_page()
+   new_leaf = LeafPage(right_sibling_page_id=..., slots=...)
+   self.buffer_pool.insert_new_page(new_leaf_id, new_leaf, current_lsn)
+   ```
+
+   Internally, this is the eviction half of step 3 followed by a direct insert, with no `pager.read_page`:
+
+   - If `len(self._cache) >= self.capacity_pages`, evict the leftmost clean entry (same scan as step 3); raise `BufferPoolFull` if every entry is dirty.
+   - `self._cache[page_id] = CachedPage(page=page, dirty=True)` — lands at MRU, born dirty.
+   - `page.last_modified_lsn = lsn`.
+
+   The page is born `dirty=True` because its bytes have not yet reached disk; the zero-filled bytes the pager wrote on `allocate_page` are placeholder content that will be overwritten by the next `flush_all`. The tree therefore does *not* call `mark_dirty` afterwards — `insert_new_page` already covers both registration and the LSN.
+
+5. **`mark_dirty(page_id, lsn)`.** The tree calls this after every mutation of an *existing* page (one it loaded via `get`). The entry *must* already be in the cache — the tree only mutates pages it just `get`-ed, so `mark_dirty` is always immediately preceded by a `get` on the same id. Look up the entry, set `entry.dirty = True`, and update the LSN:
+
+   ```python
+   entry = self._cache[page_id]
+   entry.dirty = True
+   entry.page.last_modified_lsn = max(entry.page.last_modified_lsn, lsn)
+   ```
+
+   The `max` matters: a single tree operation can touch the same page under two different WAL LSNs (rare, but a split that re-mutates the original leaf is one path). The page's recorded LSN must reflect the *latest* WAL record that touched it, never an earlier one.
+
+   Do **not** `move_to_end` here. The page is already at the MRU end (the `get` that preceded this call just promoted it), and writes shouldn't double-count as accesses.
+
+6. **`flush_all()`.** Walk every entry, encode and write the dirty ones, clear the dirty bit:
+
+   ```python
+   for page_id, entry in self._cache.items():
+       if entry.dirty:
+           buf = codec.encode_page(entry.page, self.pager.page_size_bytes)
+           self.pager.write_page(page_id, buf)
+           entry.dirty = False
+   ```
+
+   Do not fsync, do not evict, do not reorder. `flush_all`'s only job is to push dirty bytes to the pager. The actual fsync happens later, in `pager.fsync()` called by `db.close()`. The LRU order is preserved on purpose: a page that was hot before the flush is still likely to be hot after it.
+
+7. **`dirty_page_ids()` and `dirty_count`.** Both are derived on demand from the cache: a list comprehension and a `sum(1 for ...)` respectively. At iteration-4 cache sizes (256 pages by default) this is cheap, and computing it from the source of truth avoids the class of bugs where a separately-maintained counter drifts out of sync with the dict. Iteration 5's auto-checkpoint trigger reads `dirty_count` once per `put`/`delete`, which is still trivial.
+
 #### Wiring
 
-In `tree.py`, replace every `pager.read_page` + `codec.decode_page` with a single `buffer_pool.get(page_id)`, and replace every "encode and write" at the end of a mutation with a single `buffer_pool.mark_dirty(page_id, current_lsn)`. The current LSN is the LSN returned by `wal.append_put` / `wal.append_delete`, which `DB.put` / `DB.delete` now thread into `tree.insert` / `tree.delete`.
+In `tree.py`, there are three patterns to translate:
+
+- **Read an existing page.** Replace every `pager.read_page` + `codec.decode_page` with a single `buffer_pool.get(page_id)`.
+- **Mutate an existing page.** Replace every "encode and write" at the end of a mutation with a single `buffer_pool.mark_dirty(page_id, current_lsn)`.
+- **Allocate a fresh page** (during a leaf split, internal split, redistribute that needs a new sibling, or root creation). Replace `pager.allocate_page() → construct dataclass → encode → pager.write_page` with `pager.allocate_page() → construct dataclass → buffer_pool.insert_new_page(new_id, page, current_lsn)`. The pager is still the one that bumps `next_page_id`; the buffer pool is what registers the in-memory dataclass.
+
+The current LSN is the LSN returned by `wal.append_put` / `wal.append_delete`, which `DB.put` / `DB.delete` now thread into `tree.insert` / `tree.delete`. Meta updates — for example, `pager.update_meta(root_page_id=new_root_id)` on a root split — go through the pager unchanged, as described in the *What you build* section.
 
 In `db.py`:
 
 - Construct a `BufferPool(pager, cache_capacity_pages)` in `open()`.
-- Pass the buffer pool to `BTree`, not the raw pager.
+- Pass *both* the pager and the buffer pool to `BTree`. The new constructor is `BTree(pager: Pager, buffer_pool: BufferPool)`. The pager is still needed for meta operations (`allocate_page`, `get_meta`, `update_meta`); the buffer pool is the new path for tree page reads and writes.
 - `close()` calls `buffer_pool.flush_all()` before `pager.flush_meta()` and `pager.fsync()`, so all dirty pages are persisted on shutdown.
 - The `_debug` namespace gains `dirty_pages_in_cache()` and `total_pages_in_file()` for tests.
 
@@ -1048,6 +1150,7 @@ In `db.py`:
   - LRU order: with capacity 3, accessing pages [1,2,3,4] evicts page 1.
   - Touch promotes to MRU: with capacity 3, sequence [1,2,3,1,4] evicts page 2.
   - Dirty pages are pinned: at capacity, dirty pages [1,2,3], `get` page 4 raises `BufferPoolFull`.
+  - `insert_new_page` registers a fresh page as MRU and dirty, with `last_modified_lsn` set, and does not call `pager.read_page`. At capacity with one clean entry, `insert_new_page` evicts it; with all entries dirty, it raises `BufferPoolFull`.
   - `mark_dirty` updates `last_modified_lsn` to the highest LSN passed.
   - `flush_all` writes every dirty page to the pager exactly once and clears the dirty bits.
   - Eviction never writes to the pager (only `flush_all` does).

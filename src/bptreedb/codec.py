@@ -25,7 +25,7 @@ _PAGE_ID_FIELD = _UINT64_FIELD
 
 _WAL_RECORD_HEADER = Struct("<QB")
 _META_PAGE_NO_CRC = Struct("<8sIIQQ")
-_PAGE_HEADER = Struct("<B3sIIIQ")
+_PAGE_HEADER = Struct("<B3sIIIQQ")
 _SLOT_ENTRY = Struct("<II")
 
 DATA_FILE_MAGIC_PREFIX = b"BPTREEDB"
@@ -265,6 +265,7 @@ def encode_page(page: InternalPage | LeafPage, page_size_bytes: int) -> bytes:
         len(page.slots),
         free_space_start,
         free_space_end,
+        page.last_modified_lsn,
         page_id_field_value,
     )
 
@@ -275,9 +276,15 @@ def encode_page(page: InternalPage | LeafPage, page_size_bytes: int) -> bytes:
 
 def decode_page(data: bytes) -> InternalPage | LeafPage:
     reader = BufferReader(data)
-    page_type, _, slot_count, free_space_start, free_space_end, page_id_field_value = (
-        reader.read_struct(_PAGE_HEADER)
-    )
+    (
+        page_type,
+        _,
+        slot_count,
+        free_space_start,
+        free_space_end,
+        last_modified_lsn,
+        page_id_field_value,
+    ) = reader.read_struct(_PAGE_HEADER)
     match page_type:
         case PageType.INTERNAL:
             slots = []
@@ -289,6 +296,7 @@ def decode_page(data: bytes) -> InternalPage | LeafPage:
                 child_page_id = record_reader.read_struct(_PAGE_ID_FIELD)[0]
                 slots.append(InternalSlot(key=key, child_page_id=child_page_id))
             return InternalPage(
+                last_modified_lsn=last_modified_lsn,
                 leftmost_child_page_id=page_id_field_value,
                 slots=slots,
             )
@@ -302,6 +310,7 @@ def decode_page(data: bytes) -> InternalPage | LeafPage:
                 value = record_reader.read_length_prefixed_bytes()
                 slots.append(LeafSlot(key=key, value=value))
             return LeafPage(
+                last_modified_lsn=last_modified_lsn,
                 right_sibling_page_id=page_id_field_value,
                 slots=slots,
             )

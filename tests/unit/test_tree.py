@@ -2,8 +2,10 @@ import random
 
 import pytest
 
+from bptreedb.cache import BufferPool
 from bptreedb.codec import calculate_page_size
 from bptreedb.codec import encode_page
+from bptreedb.codec import get_max_leaf_record_size
 from bptreedb.debug import assert_tree_invariants
 from bptreedb.debug import bfs_walk_tree
 from bptreedb.entities import InternalPage
@@ -23,7 +25,12 @@ def pager(tmp_path):
 
 
 @pytest.fixture
-def make_tree(pager):
+def buffer_pool(pager):
+    return BufferPool(pager, capacity_pages=256)
+
+
+@pytest.fixture
+def make_tree(pager, buffer_pool):
     """Create a B+ tree given the specified (id, page) tuples."""
 
     def _make_tree(
@@ -38,7 +45,7 @@ def make_tree(pager):
             pager.write_page(page_id, encode_page(page, pager.page_size_bytes))
         pager.update_meta(root_page_id=root_page_id)
 
-        tree = BPlusTree(pager=pager)
+        tree = BPlusTree(pager=pager, buffer_pool=buffer_pool)
         assert_tree_invariants(tree)
         return tree
 
@@ -48,7 +55,7 @@ def make_tree(pager):
 @pytest.fixture
 def empty_tree(make_tree):
     return make_tree(
-        pages=[(1, LeafPage(right_sibling_page_id=0, slots=[]))],
+        pages=[(1, LeafPage(last_modified_lsn=0, right_sibling_page_id=0, slots=[]))],
         root_page_id=1,
     )
 
@@ -60,6 +67,7 @@ def single_leaf_root_tree(make_tree):
         (
             1,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=0,
                 slots=[
                     LeafSlot(key=b"baz", value=b"qux"),
@@ -120,9 +128,9 @@ def test_insert_record_too_large(empty_tree):
 
     # WHEN inserting a record that exceeds the record limit
     # THEN it raises an exception
-    msg = r"The database record is too large \(limit: 38 bytes, actual: 39 bytes\)"
+    msg = r"The database record is too large \(limit: 36 bytes, actual: 39 bytes\)"
     with pytest.raises(DBRecordTooLargeError, match=msg):
-        tree.insert(b"k" * 15, b"v" * 16)
+        tree.insert(b"k" * 15, b"v" * 16, 1)
 
 
 def test_insert_overwrite_empty(empty_tree):
@@ -130,13 +138,13 @@ def test_insert_overwrite_empty(empty_tree):
     tree = empty_tree
 
     # WHEN inserting a new key
-    tree.insert(b"foo", b"bar")
+    tree.insert(b"foo", b"bar", 1)
 
     # THEN it can be read back
     assert tree.search(b"foo") == b"bar"
 
     # WHEN overwriting the key with a new value
-    tree.insert(b"foo", b"qux")
+    tree.insert(b"foo", b"qux", 2)
 
     # THEN the new value is read back
     assert tree.search(b"foo") == b"qux"
@@ -148,7 +156,7 @@ def test_insert_single_leaf_root(single_leaf_root_tree):
     tree = single_leaf_root_tree
 
     # WHEN inserting a new key
-    tree.insert(b"xyz", b"prs")
+    tree.insert(b"xyz", b"prs", 1)
 
     # THEN the search operation should work correctly for the new key and the preexisting keys
     assert tree.search(b"baz") == b"qux"
@@ -167,22 +175,26 @@ def test_insert_until_root_split(empty_tree):
     records = [(f"record_id_{i:010d}".encode(), f"v{i:03d}".encode()) for i in range(1, 7)]
 
     # WHEN inserting multiple records (out of order), causing the leaf root to split
-    for key, value in [records[3], records[0], records[5], records[1], records[4], records[2]]:
-        tree.insert(key, value)
+    records_to_insert = [records[3], records[0], records[5], records[1], records[4], records[2]]
+    for i, (key, value) in enumerate(records_to_insert):
+        tree.insert(key, value, i + 1)
 
     # THEN the tree should allocate two more pages (new sibling leaf, new internal root)
     assert tree.pager.page_count() == 4
     assert tree.pager.get_meta().root_page_id == 3
 
-    assert tree._read_page(3) == InternalPage(
+    assert tree.buffer_pool.get(3) == InternalPage(
+        last_modified_lsn=6,
         leftmost_child_page_id=1,
         slots=[InternalSlot(key=records[3][0], child_page_id=2)],
     )
-    assert tree._read_page(1) == LeafPage(
+    assert tree.buffer_pool.get(1) == LeafPage(
+        last_modified_lsn=6,
         right_sibling_page_id=2,
         slots=[LeafSlot(key=k, value=v) for k, v in records[:3]],
     )
-    assert tree._read_page(2) == LeafPage(
+    assert tree.buffer_pool.get(2) == LeafPage(
+        last_modified_lsn=6,
         right_sibling_page_id=0,
         slots=[LeafSlot(key=k, value=v) for k, v in records[3:]],
     )
@@ -201,8 +213,8 @@ def test_insert_until_internal_split(empty_tree):
         (f"record_{i:04d}_xxxxxxxx".encode(), f"v{i:03d}".encode()) for i in range(item_count)
     ]
 
-    for key, value in records:
-        tree.insert(key, value)
+    for i, (key, value) in enumerate(records):
+        tree.insert(key, value, i + 1)
         assert_tree_invariants(tree)
 
     # THEN the tree should have reached three levels
@@ -225,9 +237,9 @@ def test_delete_existing_key(single_leaf_root_tree):
 
     # WHEN deleting an existing key
     # THEN it should return True
-    assert tree.delete(b"foo") is True
+    assert tree.delete(b"foo", 1) is True
     # THEN further attempts to delete the same key should return False
-    assert tree.delete(b"foo") is False
+    assert tree.delete(b"foo", 2) is False
 
 
 def test_delete_nonexistent_key(single_leaf_root_tree):
@@ -236,7 +248,7 @@ def test_delete_nonexistent_key(single_leaf_root_tree):
 
     # WHEN deleting a nonexistent key
     # THEN it should return False
-    assert tree.delete(b"xyz") is False
+    assert tree.delete(b"xyz", 1) is False
 
 
 def test_delete_leaf_redistribution_left(make_tree):
@@ -245,6 +257,7 @@ def test_delete_leaf_redistribution_left(make_tree):
         (
             3,
             InternalPage(
+                last_modified_lsn=6,
                 leftmost_child_page_id=1,
                 slots=[InternalSlot(key=b"long_record_key_0002", child_page_id=2)],
             ),
@@ -252,6 +265,7 @@ def test_delete_leaf_redistribution_left(make_tree):
         (
             1,
             LeafPage(
+                last_modified_lsn=3,
                 right_sibling_page_id=2,
                 slots=[
                     LeafSlot(key=b"long_record_key_0000", value=b"v000"),
@@ -262,6 +276,7 @@ def test_delete_leaf_redistribution_left(make_tree):
         (
             2,
             LeafPage(
+                last_modified_lsn=6,
                 right_sibling_page_id=0,
                 slots=[
                     LeafSlot(key=b"long_record_key_0002", value=b"v002"),
@@ -274,23 +289,26 @@ def test_delete_leaf_redistribution_left(make_tree):
     tree = make_tree(pages=pages, root_page_id=3)
 
     # WHEN deleting a key from the left child, causing it to become underpopulated
-    tree.delete(b"long_record_key_0001")
+    tree.delete(b"long_record_key_0001", 7)
 
     # THEN the tree should self-rebalance by moving slots from the right sibling
     assert tree.pager.page_count() == 4
     assert tree.pager.get_meta().root_page_id == 3
-    assert tree._read_page(3) == InternalPage(
+    assert tree.buffer_pool.get(3) == InternalPage(
+        last_modified_lsn=7,
         leftmost_child_page_id=1,
         slots=[InternalSlot(key=b"long_record_key_0003", child_page_id=2)],
     )
-    assert tree._read_page(1) == LeafPage(
+    assert tree.buffer_pool.get(1) == LeafPage(
+        last_modified_lsn=7,
         right_sibling_page_id=2,
         slots=[
             LeafSlot(key=b"long_record_key_0000", value=b"v000"),
             LeafSlot(key=b"long_record_key_0002", value=b"v002"),
         ],
     )
-    assert tree._read_page(2) == LeafPage(
+    assert tree.buffer_pool.get(2) == LeafPage(
+        last_modified_lsn=7,
         right_sibling_page_id=0,
         slots=[
             LeafSlot(key=b"long_record_key_0003", value=b"v003"),
@@ -306,6 +324,7 @@ def test_delete_leaf_redistribution_right(make_tree):
         (
             3,
             InternalPage(
+                last_modified_lsn=7,
                 leftmost_child_page_id=1,
                 slots=[InternalSlot(key=b"long_record_key_0003", child_page_id=2)],
             ),
@@ -313,6 +332,7 @@ def test_delete_leaf_redistribution_right(make_tree):
         (
             1,
             LeafPage(
+                last_modified_lsn=7,
                 right_sibling_page_id=2,
                 slots=[
                     LeafSlot(key=b"long_record_key_0000", value=b"v000"),
@@ -324,6 +344,7 @@ def test_delete_leaf_redistribution_right(make_tree):
         (
             2,
             LeafPage(
+                last_modified_lsn=7,
                 right_sibling_page_id=0,
                 slots=[
                     LeafSlot(key=b"long_record_key_0003", value=b"v003"),
@@ -335,23 +356,26 @@ def test_delete_leaf_redistribution_right(make_tree):
     tree = make_tree(pages=pages, root_page_id=3)
 
     # WHEN deleting a key from the right child, causing it to become underpopulated
-    tree.delete(b"long_record_key_0004")
+    tree.delete(b"long_record_key_0004", 8)
 
     # THEN the tree should self-rebalance by moving slots from the left sibling
     assert tree.pager.page_count() == 4
     assert tree.pager.get_meta().root_page_id == 3
-    assert tree._read_page(3) == InternalPage(
+    assert tree.buffer_pool.get(3) == InternalPage(
+        last_modified_lsn=8,
         leftmost_child_page_id=1,
         slots=[InternalSlot(key=b"long_record_key_0002", child_page_id=2)],
     )
-    assert tree._read_page(1) == LeafPage(
+    assert tree.buffer_pool.get(1) == LeafPage(
+        last_modified_lsn=8,
         right_sibling_page_id=2,
         slots=[
             LeafSlot(key=b"long_record_key_0000", value=b"v000"),
             LeafSlot(key=b"long_record_key_0001", value=b"v001"),
         ],
     )
-    assert tree._read_page(2) == LeafPage(
+    assert tree.buffer_pool.get(2) == LeafPage(
+        last_modified_lsn=8,
         right_sibling_page_id=0,
         slots=[
             LeafSlot(key=b"long_record_key_0002", value=b"v002"),
@@ -367,6 +391,7 @@ def test_delete_leaf_merge_left(make_tree):
         (
             4,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=1,
                 slots=[
                     InternalSlot(key=b"long_record_key_0002", child_page_id=2),
@@ -377,6 +402,7 @@ def test_delete_leaf_merge_left(make_tree):
         (
             1,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=2,
                 slots=[
                     LeafSlot(key=b"long_record_key_0000", value=b"v000"),
@@ -387,6 +413,7 @@ def test_delete_leaf_merge_left(make_tree):
         (
             2,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=3,
                 slots=[
                     LeafSlot(key=b"long_record_key_0002", value=b"v002"),
@@ -397,6 +424,7 @@ def test_delete_leaf_merge_left(make_tree):
         (
             3,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=0,
                 slots=[
                     LeafSlot(key=b"long_record_key_0004", value=b"v004"),
@@ -408,25 +436,28 @@ def test_delete_leaf_merge_left(make_tree):
     tree = make_tree(pages=pages, root_page_id=4)
 
     # WHEN deleting a key from the right leaf, causing it to become underpopulated
-    tree.delete(b"long_record_key_0004")
+    tree.delete(b"long_record_key_0004", 2)
 
     # THEN the tree should self-rebalance by merging the right leaf with the middle leaf
     assert tree.pager.page_count() == 5
     assert tree.pager.get_meta().root_page_id == 4
-    assert tree._read_page(4) == InternalPage(
+    assert tree.buffer_pool.get(4) == InternalPage(
+        last_modified_lsn=2,
         leftmost_child_page_id=1,
         slots=[
             InternalSlot(key=b"long_record_key_0002", child_page_id=2),
         ],
     )
-    assert tree._read_page(1) == LeafPage(
+    assert tree.buffer_pool.get(1) == LeafPage(
+        last_modified_lsn=1,
         right_sibling_page_id=2,
         slots=[
             LeafSlot(key=b"long_record_key_0000", value=b"v000"),
             LeafSlot(key=b"long_record_key_0001", value=b"v001"),
         ],
     )
-    assert tree._read_page(2) == LeafPage(
+    assert tree.buffer_pool.get(2) == LeafPage(
+        last_modified_lsn=2,
         right_sibling_page_id=0,
         slots=[
             LeafSlot(key=b"long_record_key_0002", value=b"v002"),
@@ -443,6 +474,7 @@ def test_delete_leaf_merge_right(make_tree):
         (
             4,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=1,
                 slots=[
                     InternalSlot(key=b"long_record_key_0002", child_page_id=2),
@@ -453,6 +485,7 @@ def test_delete_leaf_merge_right(make_tree):
         (
             1,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=2,
                 slots=[
                     LeafSlot(key=b"long_record_key_0000", value=b"v000"),
@@ -463,6 +496,7 @@ def test_delete_leaf_merge_right(make_tree):
         (
             2,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=3,
                 slots=[
                     LeafSlot(key=b"long_record_key_0002", value=b"v002"),
@@ -473,6 +507,7 @@ def test_delete_leaf_merge_right(make_tree):
         (
             3,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=0,
                 slots=[
                     LeafSlot(key=b"long_record_key_0004", value=b"v004"),
@@ -484,18 +519,20 @@ def test_delete_leaf_merge_right(make_tree):
     tree = make_tree(pages=pages, root_page_id=4)
 
     # WHEN deleting a key from the left leaf, causing it to become underpopulated
-    tree.delete(b"long_record_key_0000")
+    tree.delete(b"long_record_key_0000", 2)
 
     # THEN the tree should self-rebalance by merging the left leaf with the middle leaf
     assert tree.pager.page_count() == 5
     assert tree.pager.get_meta().root_page_id == 4
-    assert tree._read_page(4) == InternalPage(
+    assert tree.buffer_pool.get(4) == InternalPage(
+        last_modified_lsn=2,
         leftmost_child_page_id=1,
         slots=[
             InternalSlot(key=b"long_record_key_0004", child_page_id=3),
         ],
     )
-    assert tree._read_page(1) == LeafPage(
+    assert tree.buffer_pool.get(1) == LeafPage(
+        last_modified_lsn=2,
         right_sibling_page_id=3,
         slots=[
             LeafSlot(key=b"long_record_key_0001", value=b"v001"),
@@ -503,7 +540,8 @@ def test_delete_leaf_merge_right(make_tree):
             LeafSlot(key=b"long_record_key_0003", value=b"v003"),
         ],
     )
-    assert tree._read_page(3) == LeafPage(
+    assert tree.buffer_pool.get(3) == LeafPage(
+        last_modified_lsn=1,
         right_sibling_page_id=0,
         slots=[
             LeafSlot(key=b"long_record_key_0004", value=b"v004"),
@@ -522,6 +560,7 @@ def test_delete_leaf_merge_left_at_slot_0(make_tree):
         (
             4,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=1,
                 slots=[
                     InternalSlot(key=b"long_record_key_0020", child_page_id=2),
@@ -532,6 +571,7 @@ def test_delete_leaf_merge_left_at_slot_0(make_tree):
         (
             1,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=2,
                 slots=[
                     LeafSlot(key=b"long_record_key_0000", value=b"v000"),
@@ -542,6 +582,7 @@ def test_delete_leaf_merge_left_at_slot_0(make_tree):
         (
             2,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=3,
                 slots=[
                     LeafSlot(key=b"long_record_key_0020", value=b"v020"),
@@ -552,6 +593,7 @@ def test_delete_leaf_merge_left_at_slot_0(make_tree):
         (
             3,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=0,
                 slots=[
                     LeafSlot(key=b"long_record_key_0040", value=b"v040"),
@@ -563,18 +605,20 @@ def test_delete_leaf_merge_left_at_slot_0(make_tree):
     tree = make_tree(pages=pages, root_page_id=4)
 
     # WHEN deleting a key from page 2, making it underpopulated
-    tree.delete(b"long_record_key_0020")
+    tree.delete(b"long_record_key_0020", 2)
 
     # THEN the underpopulated leaf (page 2) should be merged into the leftmost_child (page 1)
     assert tree.pager.page_count() == 5
     assert tree.pager.get_meta().root_page_id == 4
-    assert tree._read_page(4) == InternalPage(
+    assert tree.buffer_pool.get(4) == InternalPage(
+        last_modified_lsn=2,
         leftmost_child_page_id=1,
         slots=[
             InternalSlot(key=b"long_record_key_0040", child_page_id=3),
         ],
     )
-    assert tree._read_page(1) == LeafPage(
+    assert tree.buffer_pool.get(1) == LeafPage(
+        last_modified_lsn=2,
         right_sibling_page_id=3,
         slots=[
             LeafSlot(key=b"long_record_key_0000", value=b"v000"),
@@ -582,7 +626,8 @@ def test_delete_leaf_merge_left_at_slot_0(make_tree):
             LeafSlot(key=b"long_record_key_0021", value=b"v021"),
         ],
     )
-    assert tree._read_page(3) == LeafPage(
+    assert tree.buffer_pool.get(3) == LeafPage(
+        last_modified_lsn=1,
         right_sibling_page_id=0,
         slots=[
             LeafSlot(key=b"long_record_key_0040", value=b"v040"),
@@ -611,6 +656,7 @@ def test_delete_leaf_merge_and_root_collapse(make_tree):
         (
             3,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=1,
                 slots=[InternalSlot(key=b"long_record_key_0002", child_page_id=2)],
             ),
@@ -618,6 +664,7 @@ def test_delete_leaf_merge_and_root_collapse(make_tree):
         (
             1,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=2,
                 slots=[
                     LeafSlot(key=b"long_record_key_0000", value=b"v000"),
@@ -628,6 +675,7 @@ def test_delete_leaf_merge_and_root_collapse(make_tree):
         (
             2,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=0,
                 slots=[
                     LeafSlot(key=b"long_record_key_0002", value=b"v002"),
@@ -639,12 +687,13 @@ def test_delete_leaf_merge_and_root_collapse(make_tree):
     tree = make_tree(pages=pages, root_page_id=3)
 
     # WHEN deleting a key from the left child, causing it to become underpopulated
-    tree.delete(b"long_record_key_0000")
+    tree.delete(b"long_record_key_0000", 2)
 
     # THEN the tree should self-rebalance by merging the leaf nodes and collapsing the root
     assert tree.pager.page_count() == 4
     assert tree.pager.get_meta().root_page_id == 1
-    assert tree._read_page(1) == LeafPage(
+    assert tree.buffer_pool.get(1) == LeafPage(
+        last_modified_lsn=2,
         right_sibling_page_id=0,
         slots=[
             LeafSlot(key=b"long_record_key_0001", value=b"v001"),
@@ -661,6 +710,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             10,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=11,
                 slots=[InternalSlot(key=b"long_record_key_0007", child_page_id=12)],
             ),
@@ -668,6 +718,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             11,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=1,
                 slots=[
                     InternalSlot(key=b"long_record_key_0003", child_page_id=2),
@@ -678,6 +729,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             12,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=4,
                 slots=[
                     InternalSlot(key=b"long_record_key_0009", child_page_id=5),
@@ -689,6 +741,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             1,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=2,
                 slots=[
                     LeafSlot(key=b"long_record_key_0001", value=b"v001"),
@@ -699,6 +752,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             2,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=3,
                 slots=[
                     LeafSlot(key=b"long_record_key_0003", value=b"v003"),
@@ -709,6 +763,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             3,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=4,
                 slots=[
                     LeafSlot(key=b"long_record_key_0005", value=b"v005"),
@@ -719,6 +774,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             4,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=5,
                 slots=[
                     LeafSlot(key=b"long_record_key_0007", value=b"v007"),
@@ -729,6 +785,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             5,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=6,
                 slots=[
                     LeafSlot(key=b"long_record_key_0009", value=b"v009"),
@@ -739,6 +796,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             6,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=7,
                 slots=[
                     LeafSlot(key=b"long_record_key_0011", value=b"v011"),
@@ -749,6 +807,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
         (
             7,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=0,
                 slots=[
                     LeafSlot(key=b"long_record_key_0013", value=b"v013"),
@@ -762,7 +821,7 @@ def test_delete_cascades_into_internal_redistribute(make_tree):
     # WHEN deleting key_0004
     # This will merge leaf 2 into leaf 1, underpopulate internal 11,
     # and force it to redistribute with internal 12.
-    tree.delete(b"long_record_key_0004")
+    tree.delete(b"long_record_key_0004", 2)
 
     # THEN every surviving key must still be retrievable
     survivors = [
@@ -785,6 +844,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             13,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=10,
                 slots=[
                     InternalSlot(key=b"long_record_key_0030", child_page_id=11),
@@ -796,6 +856,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             10,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=1,
                 slots=[
                     InternalSlot(key=b"long_record_key_0010", child_page_id=2),
@@ -806,6 +867,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             11,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=4,
                 slots=[
                     InternalSlot(key=b"long_record_key_0040", child_page_id=5),
@@ -816,6 +878,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             12,
             InternalPage(
+                last_modified_lsn=1,
                 leftmost_child_page_id=7,
                 slots=[
                     InternalSlot(key=b"long_record_key_0070", child_page_id=8),
@@ -827,6 +890,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             1,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=2,
                 slots=[
                     LeafSlot(b"long_record_key_0000", b"v000"),
@@ -837,6 +901,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             2,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=3,
                 slots=[
                     LeafSlot(b"long_record_key_0010", b"v010"),
@@ -847,6 +912,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             3,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=4,
                 slots=[
                     LeafSlot(b"long_record_key_0020", b"v020"),
@@ -857,6 +923,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             4,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=5,
                 slots=[
                     LeafSlot(b"long_record_key_0030", b"v030"),
@@ -867,6 +934,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             5,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=6,
                 slots=[
                     LeafSlot(b"long_record_key_0040", b"v040"),
@@ -877,6 +945,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             6,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=7,
                 slots=[
                     LeafSlot(b"long_record_key_0050", b"v050"),
@@ -887,6 +956,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             7,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=8,
                 slots=[
                     LeafSlot(b"long_record_key_0060", b"v060"),
@@ -897,6 +967,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             8,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=9,
                 slots=[
                     LeafSlot(b"long_record_key_0070", b"v070"),
@@ -907,6 +978,7 @@ def test_delete_cascades_into_internal_merge(make_tree):
         (
             9,
             LeafPage(
+                last_modified_lsn=1,
                 right_sibling_page_id=0,
                 slots=[
                     LeafSlot(b"long_record_key_0080", b"v080"),
@@ -918,17 +990,19 @@ def test_delete_cascades_into_internal_merge(make_tree):
     tree = make_tree(pages=pages, root_page_id=13)
 
     # WHEN deleting key60 (leaf 7 merges with leaf 8, then internal 12 merges with internal 11)
-    tree.delete(b"long_record_key_0060")
+    tree.delete(b"long_record_key_0060", 2)
 
     # THEN the tree should flatten to 2 levels with internal 12's subtree absorbed into page 11
     assert tree.pager.get_meta().root_page_id == 13
-    assert tree._read_page(13) == InternalPage(
+    assert tree.buffer_pool.get(13) == InternalPage(
+        last_modified_lsn=2,
         leftmost_child_page_id=10,
         slots=[
             InternalSlot(key=b"long_record_key_0030", child_page_id=11),
         ],
     )
-    assert tree._read_page(10) == InternalPage(
+    assert tree.buffer_pool.get(10) == InternalPage(
+        last_modified_lsn=1,
         leftmost_child_page_id=1,
         slots=[
             InternalSlot(key=b"long_record_key_0010", child_page_id=2),
@@ -936,7 +1010,8 @@ def test_delete_cascades_into_internal_merge(make_tree):
         ],
     )
     # page 11 must include the pulled-down separator (key60) pointing at page 7.
-    assert tree._read_page(11) == InternalPage(
+    assert tree.buffer_pool.get(11) == InternalPage(
+        last_modified_lsn=2,
         leftmost_child_page_id=4,
         slots=[
             InternalSlot(key=b"long_record_key_0040", child_page_id=5),
@@ -945,7 +1020,8 @@ def test_delete_cascades_into_internal_merge(make_tree):
             InternalSlot(key=b"long_record_key_0080", child_page_id=9),
         ],
     )
-    assert tree._read_page(7) == LeafPage(
+    assert tree.buffer_pool.get(7) == LeafPage(
+        last_modified_lsn=2,
         right_sibling_page_id=9,
         slots=[
             LeafSlot(key=b"long_record_key_0065", value=b"v065"),
@@ -977,23 +1053,29 @@ def test_split_picks_balanced_point_under_skewed_slot_sizes(tmp_path):
         med_slot = LeafSlot(key=b"b0", value=b"_" * 782)
         large_slots = [LeafSlot(key=f"c{i}".encode(), value=b"_" * 615) for i in range(3)]
         all_slots = small_slots + [med_slot] + large_slots
-        overpopulated_leaf = LeafPage(right_sibling_page_id=0, slots=list(all_slots))
+        overpopulated_leaf = LeafPage(
+            last_modified_lsn=1,
+            right_sibling_page_id=0,
+            slots=list(all_slots),
+        )
         assert calculate_page_size(overpopulated_leaf) > page_size
 
-        pager.allocate_page()
-        pager.write_page(1, encode_page(overpopulated_leaf, page_size))
+        buffer_pool = BufferPool(pager, 256)
+        buffer_pool.insert(page_id=1, page=overpopulated_leaf, lsn=2)
         pager.update_meta(root_page_id=1)
-        tree = BPlusTree(pager=pager)
+
+        tree = BPlusTree(pager=pager, buffer_pool=buffer_pool)
 
         # WHEN splitting the leaf
-        tree._split_page(page_id=1, parent_page_id=None, page=overpopulated_leaf)
+        tree._split_page(page_id=1, parent_page_id=None, page=overpopulated_leaf, lsn=2)
 
         # THEN both halves should be at or above the underpopulated threshold,
         # and, combined, they should still contain every original slot
-        new_root = tree._read_page(tree.pager.get_meta().root_page_id)
+        new_root = tree.buffer_pool.get(tree.pager.get_meta().root_page_id)
         assert isinstance(new_root, InternalPage)
-        left_half = tree._read_page(1)
-        right_half = tree._read_page(new_root.slots[0].child_page_id)
+
+        left_half = tree.buffer_pool.get(1)
+        right_half = tree.buffer_pool.get(new_root.slots[0].child_page_id)
         assert not tree._is_page_underpopulated(left_half)
         assert not tree._is_page_underpopulated(right_half)
         assert list(left_half.slots) + list(right_half.slots) == all_slots
@@ -1006,26 +1088,27 @@ def test_invariants_hold_at_4kb_with_mixed_key_lengths(tmp_path):
     pager_path = tmp_path / "pager.dat"
     with Pager(path=pager_path, page_size_bytes=page_size) as pager:
         # GIVEN an empty 4 KB tree and an oracle to cross-check every read
-        tree = BPlusTree(pager=pager)
+        tree = BPlusTree(pager=pager, buffer_pool=BufferPool(pager, 256))
         oracle: dict[bytes, bytes] = {}
 
         # Seed=7 reliably triggers a parent-inflating redistribute within 500 ops.
         rng = random.Random(7)
-        max_kv = (page_size - 24) // 5 - 8 - 8
-        length_choices = (1, 2, 4, 16, 64, 256, 400, 600)
+        # The encoded leaf record carries two 4-byte length prefixes on top of `key + value`.
+        max_kv = get_max_leaf_record_size(page_size) - 8
+        length_choices = (1, 2, 4, 16, 64, 256, 400, 500)
 
         # WHEN running 500 random insert/delete ops with varied key/value lengths
-        for _ in range(500):
+        for i in range(500):
             if oracle and rng.random() < 0.25:
                 key = rng.choice(list(oracle))
-                assert tree.delete(key) is True
+                assert tree.delete(key, i + 1) is True
                 oracle.pop(key)
             else:
                 key_len = min(rng.choice(length_choices), max_kv)
                 val_len = rng.randint(0, min(rng.choice(length_choices), max_kv - key_len))
                 key = rng.randbytes(key_len)
                 value = rng.randbytes(val_len)
-                tree.insert(key, value)
+                tree.insert(key, value, i + 1)
                 oracle[key] = value
 
             # THEN invariants should hold after every op
@@ -1036,6 +1119,46 @@ def test_invariants_hold_at_4kb_with_mixed_key_lengths(tmp_path):
             assert tree.search(key) == expected
 
 
+def test_invariants_hold_with_undersized_buffer_pool(tmp_path):
+    # The pool is sized for the worst-case cascade working set but is much smaller than the tree's
+    # total page count, so every `_find_leaf` and cascade step forces a clean-page eviction.
+    # Flushing between batches keeps the NO-STEAL pool from overflowing as dirty pages accumulate.
+    page_size = 256
+    cache_capacity = 16
+    pager_path = tmp_path / "pager.dat"
+    rng = random.Random(42)
+    oracle: dict[bytes, bytes] = {}
+
+    with Pager(path=pager_path, page_size_bytes=page_size) as pager:
+        # GIVEN a B+ tree backed by a buffer pool much smaller than its page count
+        buffer_pool = BufferPool(pager, capacity_pages=cache_capacity)
+        tree = BPlusTree(pager=pager, buffer_pool=buffer_pool)
+
+        # WHEN running 100 batches of 5 mixed insert/delete ops, flushing between batches
+        lsn_counter = 0
+        for _ in range(100):
+            for _ in range(5):
+                lsn_counter += 1
+                if oracle and rng.random() < 0.3:
+                    key = rng.choice(list(oracle))
+                    assert tree.delete(key, lsn_counter) is True
+                    oracle.pop(key)
+                else:
+                    key = rng.randbytes(4)
+                    value = rng.randbytes(rng.randint(0, 16))
+                    tree.insert(key, value, lsn_counter)
+                    oracle[key] = value
+                assert_tree_invariants(tree)
+            buffer_pool.flush_all()
+
+        # THEN every surviving key reads back the expected value through the small pool
+        for key, expected_value in oracle.items():
+            assert tree.search(key) == expected_value
+
+        # THEN a full scan returns the oracle in sorted key order
+        assert dict(tree.scan(None, None)) == oracle
+
+
 def test_stats_counters_record_splits_and_reset(empty_tree):
     # GIVEN a fresh empty tree
     tree = empty_tree
@@ -1044,7 +1167,7 @@ def test_stats_counters_record_splits_and_reset(empty_tree):
 
     # WHEN inserting enough keys to force at least one leaf split on a 256-byte page
     for i in range(100):
-        tree.insert(f"key-{i:04d}".encode(), b"v" * 16)
+        tree.insert(f"key-{i:04d}".encode(), b"v" * 16, i + 1)
 
     # THEN the split counter should have advanced
     assert tree.stats.leaf_splits >= 1

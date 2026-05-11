@@ -2,6 +2,7 @@ from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
 
+from bptreedb.cache import BufferPool
 from bptreedb.debug import assert_tree_invariants
 from bptreedb.pager import Pager
 from bptreedb.tree import BPlusTree
@@ -29,18 +30,21 @@ _op_strategy = st.one_of(
 def test_tree_invariants_hold_under_random_ops(ops, tmp_path_factory):
     pager_dir = tmp_path_factory.mktemp("tree")
     with Pager(path=pager_dir / "pager.dat", page_size_bytes=_PAGE_SIZE_BYTES) as pager:
-        tree = BPlusTree(pager=pager)
+        tree = BPlusTree(pager=pager, buffer_pool=BufferPool(pager=pager, capacity_pages=256))
         oracle: dict[bytes, bytes] = {}
+        lsn = 1
 
         for op in ops:
             match op[0]:
                 case "insert":
                     _, key, value = op
-                    tree.insert(key, value)
+                    tree.insert(key, value, lsn)
+                    lsn += 1
                     oracle[key] = value
                 case "delete":
                     _, key = op
-                    assert tree.delete(key) == (key in oracle)
+                    assert tree.delete(key, lsn) == (key in oracle)
+                    lsn += 1
                     oracle.pop(key, None)
                 case "search":
                     _, key = op

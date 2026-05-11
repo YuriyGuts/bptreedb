@@ -29,6 +29,7 @@ def test_fresh_directory_bootstrap(path):
             next_page_id=2,
         )
         assert leaf_page == LeafPage(
+            last_modified_lsn=0,
             right_sibling_page_id=0,
             slots=[],
         )
@@ -52,7 +53,7 @@ def test_reopen(path):
         pager.close()
 
     assert meta1 == meta2 == MetaPage(page_size_bytes=256, root_page_id=1, next_page_id=2)
-    assert leaf1 == leaf2 == LeafPage(right_sibling_page_id=0, slots=[])
+    assert leaf1 == leaf2 == LeafPage(last_modified_lsn=0, right_sibling_page_id=0, slots=[])
 
 
 def test_open_with_conflicting_page_size(path):

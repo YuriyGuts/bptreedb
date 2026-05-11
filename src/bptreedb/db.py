@@ -5,6 +5,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+from bptreedb.cache import BufferPool
 from bptreedb.entities import WALDeleteRecord
 from bptreedb.entities import WALPutRecord
 from bptreedb.entities import WALRecord
@@ -26,6 +27,7 @@ class DB:
         data_dir: str | Path,
         *,
         page_size_bytes: int = DEFAULT_PAGE_SIZE,
+        cache_capacity_pages: int = 256,
     ) -> None:
         """
         Create a new DB instance.
@@ -43,7 +45,8 @@ class DB:
         self.data_dir = Path(data_dir)
         self.page_size_bytes = page_size_bytes
         self.pager = Pager(self.data_dir / PAGER_FILENAME, page_size_bytes=page_size_bytes)
-        self.tree = BPlusTree(self.pager)
+        self.buffer_pool = BufferPool(self.pager, cache_capacity_pages)
+        self.tree = BPlusTree(self.pager, self.buffer_pool)
         self.wal = WAL(self.data_dir / WAL_FILENAME)
         self.is_opened = False
         self._version_counter = 0
@@ -70,6 +73,7 @@ class DB:
 
     def close(self) -> None:
         try:
+            self.buffer_pool.flush_all()
             self.wal.close()
             self.pager.close()
         finally:
@@ -97,9 +101,9 @@ class DB:
     def _apply_wal_record(self, record: WALRecord) -> None:
         match record:
             case WALPutRecord():
-                self.tree.insert(record.key, record.value)
+                self.tree.insert(record.key, record.value, record.lsn)
             case WALDeleteRecord():
-                self.tree.delete(record.key)
+                self.tree.delete(record.key, record.lsn)
 
     def _ensure_bytes_type(self, value: bytes, param_name: str) -> None:
         if not isinstance(value, bytes):
@@ -109,8 +113,8 @@ class DB:
         self._check_if_opened()
         self._ensure_bytes_type(key, "key")
         self._ensure_bytes_type(value, "value")
-        self.wal.append_put(key, value)
-        self.tree.insert(key, value)
+        lsn = self.wal.append_put(key, value)
+        self.tree.insert(key, value, lsn)
         self._version_counter += 1
 
     def get(self, key: bytes) -> bytes | None:
@@ -124,8 +128,8 @@ class DB:
         if self.tree.search(key) is None:
             return False
 
-        self.wal.append_delete(key)
-        self.tree.delete(key)
+        lsn = self.wal.append_delete(key)
+        self.tree.delete(key, lsn)
         self._version_counter += 1
         return True
 

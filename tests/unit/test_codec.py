@@ -153,6 +153,7 @@ def test_meta_page_encode_decode():
 
 def test_internal_page_encode_decode():
     page = InternalPage(
+        last_modified_lsn=23456,
         leftmost_child_page_id=12345,
         slots=[
             InternalSlot(b"bar", 42),
@@ -163,8 +164,9 @@ def test_internal_page_encode_decode():
     expected_header = (
         b"\x01\x00\x00\x00"
         b"\x03\x00\x00\x00"
-        b"\x30\x00\x00\x00"
+        b"\x38\x00\x00\x00"
         b"\xd2\x00\x00\x00"
+        b"\xa0\x5b\x00\x00\x00\x00\x00\x00"
         b"\x39\x30\x00\x00\x00\x00\x00\x00"
     )
     expected_slots = (
@@ -177,7 +179,7 @@ def test_internal_page_encode_decode():
         b"\x03\x00\x00\x00foo\x2b\x00\x00\x00\x00\x00\x00\x00"
         b"\x03\x00\x00\x00bar\x2a\x00\x00\x00\x00\x00\x00\x00"
     )
-    expected_free_space = bytes(162)
+    expected_free_space = bytes(154)
     encoded = encode_page(page, page_size_bytes=256)
     assert encoded == expected_header + expected_slots + expected_free_space + expected_records
 
@@ -187,6 +189,7 @@ def test_internal_page_encode_decode():
 
 def test_leaf_page_encode_decode():
     page = LeafPage(
+        last_modified_lsn=12345,
         right_sibling_page_id=67890,
         slots=[
             LeafSlot(b"baz", b"qux"),
@@ -197,8 +200,9 @@ def test_leaf_page_encode_decode():
     expected_header = (
         b"\x02\x00\x00\x00"
         b"\x03\x00\x00\x00"
-        b"\x30\x00\x00\x00"
+        b"\x38\x00\x00\x00"
         b"\xd3\x00\x00\x00"
+        b"\x39\x30\x00\x00\x00\x00\x00\x00"
         b"\x32\x09\x01\x00\x00\x00\x00\x00"
     )
     expected_slots = (
@@ -211,7 +215,7 @@ def test_leaf_page_encode_decode():
         b"\x05\x00\x00\x00corge\x04\x00\x00\x00thud"
         b"\x03\x00\x00\x00baz\x03\x00\x00\x00qux"
     )
-    expected_free_space = bytes(163)
+    expected_free_space = bytes(155)
     encoded = encode_page(page, page_size_bytes=256)
     assert encoded == expected_header + expected_slots + expected_free_space + expected_records
 

@@ -26,3 +26,8 @@ class DBRecordTooLargeError(DBError):
 class DBConcurrentPageModificationError(DBError):
     def __init__(self, message: str = "The database was modified during iteration") -> None:
         super().__init__(message)
+
+
+class DBBufferPoolOverflowError(DBError):
+    def __init__(self, message: str = "Buffer pool is at capacity, cannot add new pages") -> None:
+        super().__init__(message)

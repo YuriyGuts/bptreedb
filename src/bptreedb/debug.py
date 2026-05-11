@@ -16,7 +16,7 @@ class BPlusTreeNode:
 
 
 def page_id_to_node(tree: BPlusTree, page_id: int) -> BPlusTreeNode:
-    page = tree._read_page(page_id)
+    page = tree.buffer_pool.get(page_id)
     return BPlusTreeNode(page_id=page_id, page=page, children=[])
 
 

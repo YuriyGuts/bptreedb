@@ -38,6 +38,7 @@ class InternalSlot:
 
 @dataclass
 class InternalPage:
+    last_modified_lsn: int
     leftmost_child_page_id: int
     slots: list[InternalSlot]
 
@@ -53,6 +54,7 @@ class LeafSlot:
 
 @dataclass
 class LeafPage:
+    last_modified_lsn: int
     right_sibling_page_id: int
     slots: list[LeafSlot]
 

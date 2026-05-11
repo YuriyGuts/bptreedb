@@ -72,6 +72,7 @@ class Pager:
         )
         leaf_page_id = self.allocate_page()
         initial_leaf_page = LeafPage(
+            last_modified_lsn=0,
             right_sibling_page_id=0,
             slots=[],
         )
