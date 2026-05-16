@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -7,6 +8,7 @@ from typing import Self
 
 from bptreedb.codec import decode_next_wal_record_from_file
 from bptreedb.codec import encode_wal_record
+from bptreedb.entities import WALCheckpointRecord
 from bptreedb.entities import WALDeleteRecord
 from bptreedb.entities import WALPutRecord
 from bptreedb.entities import WALRecord
@@ -33,6 +35,7 @@ class WALStats:
 class WAL:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.checkpoint_temp_path = path.with_name(path.name + ".new")
         self.current_lsn = 0
         self.stats = WALStats()
         self._fd: IO[bytes] | None = None
@@ -40,6 +43,9 @@ class WAL:
     def open(self) -> None:
         if self._fd is not None:
             return
+
+        # A previous `truncate_before` call may have crashed mid-rotation.
+        self.checkpoint_temp_path.unlink(missing_ok=True)
 
         self.current_lsn = 0
         wal_already_existed = self.path.exists()
@@ -68,6 +74,10 @@ class WAL:
         # Do not suppress exceptions.
         return False
 
+    @property
+    def size_bytes(self) -> int:
+        return self.path.stat().st_size
+
     def append_put(self, key: bytes, value: bytes) -> int:
         record = WALPutRecord(
             lsn=self.current_lsn + 1,
@@ -83,6 +93,15 @@ class WAL:
         )
         return self._append(record)
 
+    def append_checkpoint(self, root_page_id: int, freelist_head: int, next_page_id: int) -> int:
+        record = WALCheckpointRecord(
+            lsn=self.current_lsn + 1,
+            root_page_id=root_page_id,
+            freelist_head=freelist_head,
+            next_page_id=next_page_id,
+        )
+        return self._append(record)
+
     def _append(self, record: WALRecord) -> int:
         assert self._fd is not None
         encoded = encode_wal_record(record)
@@ -94,11 +113,10 @@ class WAL:
         self.stats.fsyncs += 1
         return record.lsn
 
-    def replay(self, callback: Callable[[WALRecord], None]) -> None:
+    def _iter_records(self) -> Iterator[WALRecord]:
         assert self._fd is not None
         self._fd.seek(0)
-        self.current_lsn = 0
-        last_good_file_pos = 0
+        last_lsn = 0
         already_encountered_broken_record = False
 
         while True:
@@ -107,24 +125,46 @@ class WAL:
                 if already_encountered_broken_record:
                     msg = "WAL contains a broken record followed by a valid record"
                     raise DBCorruptedError(msg)
-                if self.current_lsn and record.lsn != self.current_lsn + 1:
-                    msg = (
-                        "WAL contains non-sequential LSNs: "
-                        f"{self.current_lsn} followed by {record.lsn}"
-                    )
+                if last_lsn and record.lsn != last_lsn + 1:
+                    msg = f"WAL contains non-sequential LSNs: {last_lsn} followed by {record.lsn}"
                     raise DBCorruptedError(msg)
 
-                last_good_file_pos = self._fd.tell()
-                self.current_lsn = record.lsn
-                self.stats.records_replayed += 1
-                callback(record)
+                last_lsn = record.lsn
+                yield record
             except DBChecksumError:
                 already_encountered_broken_record = True
             except EOFError:
                 break
 
-        # Truncate the file after the last known good record.
+    def replay(self, callback: Callable[[WALRecord], None]) -> None:
+        assert self._fd is not None
+        self.current_lsn = 0
+        last_good_file_pos = 0
+
+        for record in self._iter_records():
+            last_good_file_pos = self._fd.tell()
+            self.current_lsn = record.lsn
+            self.stats.records_replayed += 1
+            callback(record)
+
+        # Truncate any partial record at the tail.
         self._fd.seek(last_good_file_pos)
         self._fd.truncate()
         fsync_file(self._fd)
         self.stats.fsyncs += 1
+
+    def truncate_before(self, lsn: int) -> None:
+        assert self._fd is not None
+
+        # Generate a new WAL file, transfer newer records there, and replace the old WAL with it.
+        with open(self.checkpoint_temp_path, "wb") as new_wal_file:
+            for record in self._iter_records():
+                if record.lsn >= lsn:
+                    new_wal_file.write(encode_wal_record(record))
+            fsync_file(new_wal_file)
+
+        self.checkpoint_temp_path.replace(self.path)
+        fsync_directory(self.path.parent)
+
+        self._fd.close()
+        self._fd = open(self.path, "a+b")  # noqa: SIM115

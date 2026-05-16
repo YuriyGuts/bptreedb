@@ -69,17 +69,23 @@ def test_delete_survives_crash(tmp_path: Path, faulty_files: FaultyFileFixture) 
         assert recovered.get(b"baz") == b"\x03"
 
 
-def test_partial_record_truncated_on_reopen(tmp_path: Path) -> None:
-    # GIVEN a DB with one key whose WAL record is hand-truncated by one byte
-    with DB(tmp_path) as db:
-        db.put(b"foo", b"\x01")
+def test_partial_record_truncated_on_reopen(
+    tmp_path: Path, faulty_files: FaultyFileFixture
+) -> None:
+    # The simulated crash skips the close-time checkpoint that would otherwise persist `foo` to the
+    # data file. We need the `put` to be living only in the WAL so the torn-tail truncation actually
+    # drops it.
 
+    # GIVEN a DB with one un-checkpointed put, crashed, with its on-disk WAL torn by one byte
+    db = DB(tmp_path)
+    db.open()
+    db.put(b"foo", b"\x01")
+    faulty_files.crash_all()
     wal_path = tmp_path / WAL_FILENAME
-    contents = wal_path.read_bytes()
-    wal_path.write_bytes(contents[:-1])
+    wal_path.write_bytes(wal_path.read_bytes()[:-1])
 
     # WHEN reopening the DB
-    # THEN the partial record is dropped and the key is gone
+    # THEN the torn record is dropped on replay and the key is gone
     with DB(tmp_path) as recovered:
         assert recovered.get(b"foo") is None
 

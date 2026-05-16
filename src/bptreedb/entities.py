@@ -21,10 +21,18 @@ class WALDeleteRecord(WALRecord):
 
 
 @dataclass
+class WALCheckpointRecord(WALRecord):
+    root_page_id: int
+    freelist_head: int
+    next_page_id: int
+
+
+@dataclass
 class MetaPage:
     page_size_bytes: int
     root_page_id: int
     next_page_id: int
+    last_checkpoint_lsn: int
 
     def copy(self) -> MetaPage:
         return copy.deepcopy(self)

@@ -11,6 +11,7 @@ from bptreedb.entities import InternalSlot
 from bptreedb.entities import LeafPage
 from bptreedb.entities import LeafSlot
 from bptreedb.entities import MetaPage
+from bptreedb.entities import WALCheckpointRecord
 from bptreedb.entities import WALDeleteRecord
 from bptreedb.entities import WALPutRecord
 from bptreedb.entities import WALRecord
@@ -24,7 +25,7 @@ _CRC32_FIELD = _UINT32_FIELD
 _PAGE_ID_FIELD = _UINT64_FIELD
 
 _WAL_RECORD_HEADER = Struct("<QB")
-_META_PAGE_NO_CRC = Struct("<8sIIQQ")
+_META_PAGE_NO_CRC = Struct("<8sIIQQQ")
 _PAGE_HEADER = Struct("<B3sIIIQQ")
 _SLOT_ENTRY = Struct("<II")
 
@@ -116,6 +117,7 @@ class BufferWriter:
 class WALOperationType(IntEnum):
     PUT = 0x01
     DELETE = 0x02
+    CHECKPOINT = 0x03
 
 
 class PageType(IntEnum):
@@ -142,6 +144,11 @@ def encode_wal_record(record: WALRecord) -> bytes:
         case WALDeleteRecord():
             op_type = WALOperationType.DELETE
             payload_writer.write_length_prefixed_bytes(record.key)
+        case WALCheckpointRecord():
+            op_type = WALOperationType.CHECKPOINT
+            payload_writer.write_struct(_UINT64_FIELD, record.root_page_id)
+            payload_writer.write_struct(_UINT64_FIELD, record.freelist_head)
+            payload_writer.write_struct(_UINT64_FIELD, record.next_page_id)
         case _:
             raise ValueError(f"Unknown operation type {type(record)}")
 
@@ -171,6 +178,16 @@ def decode_wal_record(data: bytes) -> WALRecord:
         case WALOperationType.DELETE:
             key = reader.read_length_prefixed_bytes()
             return WALDeleteRecord(lsn=lsn, key=key)
+        case WALOperationType.CHECKPOINT:
+            root_page_id = reader.read_struct(_UINT64_FIELD)[0]
+            freelist_head = reader.read_struct(_UINT64_FIELD)[0]
+            next_page_id = reader.read_struct(_UINT64_FIELD)[0]
+            return WALCheckpointRecord(
+                lsn=lsn,
+                root_page_id=root_page_id,
+                freelist_head=freelist_head,
+                next_page_id=next_page_id,
+            )
         case _:
             raise ValueError(f"Unknown operation type {op_type}")
 
@@ -200,6 +217,7 @@ def encode_meta_page(page: MetaPage) -> bytes:
         page.page_size_bytes,
         page.root_page_id,
         page.next_page_id,
+        page.last_checkpoint_lsn,
     )
     writer.write_crc32()
     zero_padding = bytes(page.page_size_bytes - len(writer))
@@ -219,6 +237,7 @@ def decode_meta_page(data: bytes) -> MetaPage:
         page_size_bytes=unpacked[2],
         root_page_id=unpacked[3],
         next_page_id=unpacked[4],
+        last_checkpoint_lsn=unpacked[5],
     )
 
 

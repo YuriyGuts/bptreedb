@@ -35,12 +35,17 @@ class BufferPool:
     def __init__(self, pager: Pager, capacity_pages: int) -> None:
         self.pager = pager
         self.capacity_pages = capacity_pages
+        self.enable_eviction = True
         self.stats = BufferPoolStats()
         self._cache: OrderedDict[int, CachedPage] = OrderedDict()
 
     @property
     def dirty_count(self) -> int:
         return sum(1 for cached_page in self._cache.values() if cached_page.is_dirty)
+
+    @property
+    def dirty_ratio(self) -> float:
+        return self.dirty_count / self.capacity_pages
 
     def get(self, page_id: int) -> LeafPage | InternalPage:
         # Cache hit.
@@ -84,6 +89,9 @@ class BufferPool:
         return result
 
     def _evict_oldest_clean_page_if_full(self) -> None:
+        if not self.enable_eviction:
+            return
+
         if len(self._cache) >= self.capacity_pages:
             try:
                 page_id_to_evict = next(

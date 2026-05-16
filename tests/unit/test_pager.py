@@ -1,3 +1,5 @@
+import zlib
+
 import pytest
 
 from bptreedb.codec import decode_meta_page
@@ -27,6 +29,7 @@ def test_fresh_directory_bootstrap(path):
             page_size_bytes=256,
             root_page_id=1,
             next_page_id=2,
+            last_checkpoint_lsn=0,
         )
         assert leaf_page == LeafPage(
             last_modified_lsn=0,
@@ -52,7 +55,11 @@ def test_reopen(path):
     finally:
         pager.close()
 
-    assert meta1 == meta2 == MetaPage(page_size_bytes=256, root_page_id=1, next_page_id=2)
+    assert (
+        meta1
+        == meta2
+        == MetaPage(page_size_bytes=256, root_page_id=1, next_page_id=2, last_checkpoint_lsn=0)
+    )
     assert leaf1 == leaf2 == LeafPage(last_modified_lsn=0, right_sibling_page_id=0, slots=[])
 
 
@@ -64,11 +71,16 @@ def test_open_with_conflicting_page_size(path):
 
 
 def test_open_with_broken_crc(path):
-    page_data = encode_meta_page(MetaPage(page_size_bytes=256, root_page_id=1, next_page_id=2))
-    page_data = page_data[:32] + b"\x01\x02\x03\x04"
-    path.write_bytes(page_data)
+    # The encoded meta page is `<8sIIQQQ>` = 40 bytes followed by a 4-byte CRC.
+    crc_offset = 40
+    valid = encode_meta_page(
+        MetaPage(page_size_bytes=256, root_page_id=1, next_page_id=2, last_checkpoint_lsn=0)
+    )
+    corrupted = valid[:crc_offset] + b"\x01\x02\x03\x04"
+    path.write_bytes(corrupted)
 
-    msg = "Checksum mismatch: expected 0x04030201, actual 0xa2e8bbcd"
+    actual_crc = zlib.crc32(valid[:crc_offset])
+    msg = f"Checksum mismatch: expected 0x04030201, actual 0x{actual_crc:08x}"
     with pytest.raises(DBChecksumError, match=msg):
         with Pager(path, page_size_bytes=256):
             pass
@@ -91,8 +103,12 @@ def test_update_meta(path):
         file_contents_after = path.read_bytes()
 
     assert file_contents_before == file_contents_after
-    assert initial_meta == MetaPage(page_size_bytes=256, root_page_id=1, next_page_id=2)
-    assert updated_meta == MetaPage(page_size_bytes=256, root_page_id=1, next_page_id=42)
+    assert initial_meta == MetaPage(
+        page_size_bytes=256, root_page_id=1, next_page_id=2, last_checkpoint_lsn=0
+    )
+    assert updated_meta == MetaPage(
+        page_size_bytes=256, root_page_id=1, next_page_id=42, last_checkpoint_lsn=0
+    )
 
 
 def test_flush_meta(path):
@@ -104,8 +120,12 @@ def test_flush_meta(path):
     with Pager(path, page_size_bytes=256) as pager:
         updated_meta = pager.get_meta()
 
-    assert initial_meta == MetaPage(page_size_bytes=256, root_page_id=1, next_page_id=2)
-    assert updated_meta == MetaPage(page_size_bytes=256, root_page_id=99, next_page_id=42)
+    assert initial_meta == MetaPage(
+        page_size_bytes=256, root_page_id=1, next_page_id=2, last_checkpoint_lsn=0
+    )
+    assert updated_meta == MetaPage(
+        page_size_bytes=256, root_page_id=99, next_page_id=42, last_checkpoint_lsn=0
+    )
 
 
 def test_allocate_page(path):
@@ -116,7 +136,9 @@ def test_allocate_page(path):
         final_meta = pager.get_meta()
 
     assert path.stat().st_size == pager.page_size_bytes * 5
-    assert final_meta == MetaPage(page_size_bytes=256, root_page_id=1, next_page_id=5)
+    assert final_meta == MetaPage(
+        page_size_bytes=256, root_page_id=1, next_page_id=5, last_checkpoint_lsn=0
+    )
 
 
 def test_read_nonexistent(path):

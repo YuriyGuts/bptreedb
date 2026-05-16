@@ -12,6 +12,7 @@ from bptreedb.entities import InternalSlot
 from bptreedb.entities import LeafPage
 from bptreedb.entities import LeafSlot
 from bptreedb.entities import MetaPage
+from bptreedb.entities import WALCheckpointRecord
 from bptreedb.entities import WALDeleteRecord
 from bptreedb.entities import WALPutRecord
 from bptreedb.exceptions import DBChecksumError
@@ -134,6 +135,7 @@ def test_meta_page_encode_decode():
         page_size_bytes=256,
         root_page_id=12345,
         next_page_id=67890,
+        last_checkpoint_lsn=99,
     )
     encoded = encode_meta_page(page)
     expected_payload = (
@@ -141,14 +143,36 @@ def test_meta_page_encode_decode():
         b"\x00\x01\x00\x00"
         b"\x39\x30\x00\x00\x00\x00\x00\x00"
         b"\x32\x09\x01\x00\x00\x00\x00\x00"
-        b"\xbb\x05\x4d\x37"
+        b"\x63\x00\x00\x00\x00\x00\x00\x00"
+        b"\x43\xe0\x25\x42"
     )
-    padding = bytes(220)
+    padding = bytes(212)
     assert len(encoded) == page.page_size_bytes
     assert encoded == expected_payload + padding
 
     decoded = decode_meta_page(encoded)
     assert decoded == page
+
+
+def test_wal_checkpoint_record_encode_decode():
+    # GIVEN a CHECKPOINT WAL record
+    record = WALCheckpointRecord(lsn=123, root_page_id=5, freelist_head=0, next_page_id=7)
+    # WHEN encoding it to wire format
+    encoded = encode_wal_record(record)
+    # THEN it should produce the correct bytes
+    assert encoded == (
+        b"\x25\x00\x00\x00"
+        b"\x7b\x00\x00\x00\x00\x00\x00\x00\x03"
+        b"\x05\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x07\x00\x00\x00\x00\x00\x00\x00"
+        b"\x9d\xf3\x11\x8e"
+    )
+
+    # WHEN decoding the encoded data back
+    decoded = decode_wal_record(encoded)
+    # THEN it should produce the original record
+    assert decoded == record
 
 
 def test_internal_page_encode_decode():

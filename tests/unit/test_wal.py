@@ -1,6 +1,7 @@
 import pytest
 
 from bptreedb.codec import encode_wal_record
+from bptreedb.entities import WALCheckpointRecord
 from bptreedb.entities import WALDeleteRecord
 from bptreedb.entities import WALPutRecord
 from bptreedb.exceptions import DBCorruptedError
@@ -166,3 +167,97 @@ def test_append_after_replay(make_wal):
         replayed_records = collect_replay(wal)
         expected_new_wal_records = [WALPutRecord(lsn=3, key=b"baz", value=b"qux")]
         assert replayed_records == preexisting_wal_records + expected_new_wal_records
+
+
+def test_append_checkpoint(make_wal):
+    # GIVEN an empty WAL
+    with make_wal(b"") as wal:
+        # WHEN appending a CHECKPOINT record
+        wal.append_checkpoint(root_page_id=3, freelist_head=0, next_page_id=7)
+        # THEN replaying yields that record
+        records = collect_replay(wal)
+        assert records == [
+            WALCheckpointRecord(lsn=1, root_page_id=3, freelist_head=0, next_page_id=7),
+        ]
+
+
+def test_truncate_before_drops_earlier_records(make_wal):
+    # GIVEN a WAL with three PUTs followed by a CHECKPOINT
+    with make_wal(b"") as wal:
+        wal.append_put(b"a", b"1")
+        wal.append_put(b"b", b"2")
+        wal.append_put(b"c", b"3")
+        checkpoint_lsn = wal.append_checkpoint(root_page_id=1, freelist_head=0, next_page_id=2)
+
+        # WHEN truncating before the checkpoint
+        wal.truncate_before(checkpoint_lsn)
+
+        # THEN only the CHECKPOINT marker survives
+        records = collect_replay(wal)
+        assert records == [
+            WALCheckpointRecord(
+                lsn=checkpoint_lsn, root_page_id=1, freelist_head=0, next_page_id=2
+            ),
+        ]
+
+
+def test_truncate_before_keeps_records_at_or_after_lsn(make_wal):
+    # GIVEN a WAL with records on both sides of a checkpoint
+    with make_wal(b"") as wal:
+        wal.append_put(b"a", b"1")
+        wal.append_put(b"b", b"2")
+        checkpoint_lsn = wal.append_checkpoint(root_page_id=1, freelist_head=0, next_page_id=2)
+        wal.append_put(b"c", b"3")
+
+        # WHEN truncating before the checkpoint
+        wal.truncate_before(checkpoint_lsn)
+
+        # THEN the CHECKPOINT and the post-checkpoint record survive
+        records = collect_replay(wal)
+        assert records == [
+            WALCheckpointRecord(
+                lsn=checkpoint_lsn, root_page_id=1, freelist_head=0, next_page_id=2
+            ),
+            WALPutRecord(lsn=checkpoint_lsn + 1, key=b"c", value=b"3"),
+        ]
+
+
+def test_truncate_before_allows_subsequent_appends(make_wal):
+    # Guards against a regression where the live file handle wasn't reopened after the
+    # rename: appends would silently land in the orphaned inode and be lost on close.
+    with make_wal(b"") as wal:
+        wal.append_put(b"a", b"1")
+        checkpoint_lsn = wal.append_checkpoint(root_page_id=1, freelist_head=0, next_page_id=2)
+
+        # WHEN truncating, then appending a new record
+        wal.truncate_before(checkpoint_lsn)
+        new_lsn = wal.append_put(b"b", b"2")
+
+        # THEN the new record is in the live WAL and replays correctly
+        records = collect_replay(wal)
+        assert new_lsn == checkpoint_lsn + 1
+        assert records == [
+            WALCheckpointRecord(
+                lsn=checkpoint_lsn, root_page_id=1, freelist_head=0, next_page_id=2
+            ),
+            WALPutRecord(lsn=new_lsn, key=b"b", value=b"2"),
+        ]
+
+
+def test_open_removes_stale_temp_wal(tmp_path):
+    # Models a crash mid-`truncate_before`: the new file was written but the rename
+    # never happened. Opening must discard the stale `.wal.new` and keep `.wal` intact.
+    wal_path = tmp_path / "bptreedb.wal"
+    temp_path = tmp_path / "bptreedb.wal.new"
+
+    valid_record = WALPutRecord(lsn=1, key=b"foo", value=b"bar")
+    wal_path.write_bytes(encode_wal_record(valid_record))
+    temp_path.write_bytes(b"\x00garbage from a crashed truncate\x00")
+
+    # WHEN opening the WAL
+    with WAL(wal_path) as wal:
+        # THEN the stale temp file is gone
+        assert not temp_path.exists()
+        # THEN the original WAL still replays correctly
+        records = collect_replay(wal)
+        assert records == [valid_record]

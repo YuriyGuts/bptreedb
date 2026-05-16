@@ -6,9 +6,11 @@ from types import TracebackType
 from typing import Self
 
 from bptreedb.cache import BufferPool
+from bptreedb.entities import WALCheckpointRecord
 from bptreedb.entities import WALDeleteRecord
 from bptreedb.entities import WALPutRecord
 from bptreedb.entities import WALRecord
+from bptreedb.exceptions import DBBufferPoolOverflowError
 from bptreedb.exceptions import DBClosedError
 from bptreedb.exceptions import DBConcurrentPageModificationError
 from bptreedb.fs import fsync_directory
@@ -28,6 +30,8 @@ class DB:
         *,
         page_size_bytes: int = DEFAULT_PAGE_SIZE,
         cache_capacity_pages: int = 256,
+        checkpoint_wal_size_bytes: int = 4 * 1024 * 1024,
+        checkpoint_dirty_page_ratio: float = 0.5,
     ) -> None:
         """
         Create a new DB instance.
@@ -41,15 +45,23 @@ class DB:
             The size of the page in bytes.
             Applies only to newly created databases; existing ones will use the page size
             stored in the metadata.
+        checkpoint_wal_size_bytes
+            When the WAL grows past this size, the next write operation triggers a checkpoint.
+        checkpoint_dirty_page_ratio
+            When the fraction of dirty pages in the buffer pool exceeds this ratio, the next write
+            operation triggers a checkpoint.
         """
         self.data_dir = Path(data_dir)
         self.page_size_bytes = page_size_bytes
+        self.checkpoint_wal_size_bytes = checkpoint_wal_size_bytes
+        self.checkpoint_dirty_page_ratio = checkpoint_dirty_page_ratio
         self.pager = Pager(self.data_dir / PAGER_FILENAME, page_size_bytes=page_size_bytes)
         self.buffer_pool = BufferPool(self.pager, cache_capacity_pages)
         self.tree = BPlusTree(self.pager, self.buffer_pool)
         self.wal = WAL(self.data_dir / WAL_FILENAME)
         self.is_opened = False
         self._version_counter = 0
+        self._recovery_last_checkpoint_lsn = 0
 
     def open(self) -> None:
         dir_already_existed = self.data_dir.exists()
@@ -57,23 +69,27 @@ class DB:
         if not dir_already_existed:
             fsync_directory(self.data_dir.parent)
 
-        # Reset the data file to a clean state.
-        # In the current implementation, we replay all writes from the WAL.
-        self.pager.path.unlink(missing_ok=True)
-
         self.pager.open()
         self.wal.open()
         try:
+            self.buffer_pool.enable_eviction = False
+            self._recovery_last_checkpoint_lsn = self.pager.get_meta().last_checkpoint_lsn
             self.wal.replay(self._apply_wal_record)
+            self.buffer_pool.enable_eviction = True
+            self.checkpoint()
         except Exception:
             self.wal.close()
+            self.pager.close()
             raise
 
         self.is_opened = True
 
     def close(self) -> None:
+        if not self.is_opened:
+            return
+
         try:
-            self.buffer_pool.flush_all()
+            self.checkpoint()
             self.wal.close()
             self.pager.close()
         finally:
@@ -99,23 +115,43 @@ class DB:
             raise DBClosedError()
 
     def _apply_wal_record(self, record: WALRecord) -> None:
+        if record.lsn <= self._recovery_last_checkpoint_lsn:
+            return
+
         match record:
             case WALPutRecord():
                 self.tree.insert(record.key, record.value, record.lsn)
             case WALDeleteRecord():
                 self.tree.delete(record.key, record.lsn)
+            case WALCheckpointRecord():
+                pass
 
     def _ensure_bytes_type(self, value: bytes, param_name: str) -> None:
         if not isinstance(value, bytes):
             raise TypeError(f"{param_name} must have the bytes type")
 
+    def _maybe_checkpoint_after_write(self) -> None:
+        should_checkpoint = (
+            self.wal.size_bytes > self.checkpoint_wal_size_bytes
+            or self.buffer_pool.dirty_ratio > self.checkpoint_dirty_page_ratio
+        )
+        if should_checkpoint:
+            self.checkpoint()
+
     def put(self, key: bytes, value: bytes) -> None:
         self._check_if_opened()
         self._ensure_bytes_type(key, "key")
         self._ensure_bytes_type(value, "value")
+
         lsn = self.wal.append_put(key, value)
-        self.tree.insert(key, value, lsn)
+        try:
+            self.tree.insert(key, value, lsn)
+        except DBBufferPoolOverflowError:
+            self.checkpoint()
+            self.tree.insert(key, value, lsn)
+
         self._version_counter += 1
+        self._maybe_checkpoint_after_write()
 
     def get(self, key: bytes) -> bytes | None:
         self._check_if_opened()
@@ -129,8 +165,14 @@ class DB:
             return False
 
         lsn = self.wal.append_delete(key)
-        self.tree.delete(key, lsn)
+        try:
+            self.tree.delete(key, lsn)
+        except DBBufferPoolOverflowError:
+            self.checkpoint()
+            self.tree.delete(key, lsn)
+
         self._version_counter += 1
+        self._maybe_checkpoint_after_write()
         return True
 
     def scan(
@@ -155,3 +197,18 @@ class DB:
                 raise DBConcurrentPageModificationError()
 
         return self.tree.scan(start_key_inclusive, end_key_exclusive, check_version)
+
+    def checkpoint(self) -> None:
+        checkpoint_lsn = self.wal.current_lsn + 1
+        self.buffer_pool.flush_all()
+        self.pager.fsync()
+        meta = self.pager.get_meta()
+        self.wal.append_checkpoint(
+            root_page_id=meta.root_page_id,
+            freelist_head=0,
+            next_page_id=meta.next_page_id,
+        )
+        self.pager.update_meta(last_checkpoint_lsn=checkpoint_lsn)
+        self.pager.flush_meta()
+        self.pager.fsync()
+        self.wal.truncate_before(checkpoint_lsn)

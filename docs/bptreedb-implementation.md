@@ -1241,6 +1241,8 @@ Additionally:
 
 #### The recovery procedure in `DB.open()`
 
+Behavior change from earlier iterations: do **not** wipe the data file on `open()` anymore. Earlier iterations could get away with that because the WAL was the sole source of truth; now the data file holds everything up to `meta.last_checkpoint_lsn`, and wiping it would discard all pre-checkpoint state on the first reopen.
+
 1. The pager has already validated the meta page during its `open()`. (If the CRC fails, `DBCorruptedError` is raised there.)
 2. Open the WAL. Call `wal.replay(self._apply_wal_record_for_recovery)`.
 3. In the recovery callback, skip records with `lsn ≤ meta.last_checkpoint_lsn` — those are already reflected in the data file. For remaining PUT / DELETE records, call `tree.insert` / `tree.delete`. CHECKPOINT records are always skipped.

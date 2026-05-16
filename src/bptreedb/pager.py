@@ -69,6 +69,7 @@ class Pager:
             page_size_bytes=self.page_size_bytes,
             root_page_id=DEFAULT_ROOT_PAGE_ID,
             next_page_id=DEFAULT_ROOT_PAGE_ID,
+            last_checkpoint_lsn=0,
         )
         leaf_page_id = self.allocate_page()
         initial_leaf_page = LeafPage(
