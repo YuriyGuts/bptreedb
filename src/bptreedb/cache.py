@@ -59,6 +59,7 @@ class BufferPool:
 
         # Cache miss, below capacity.
         page = decode_page(self.pager.read_page(page_id))
+        assert isinstance(page, (LeafPage, InternalPage))
         self._cache[page_id] = CachedPage(page=page, is_dirty=False)
         self.stats.cache_misses += 1
         return page
@@ -73,6 +74,9 @@ class BufferPool:
         cached_page = self._cache[page_id]
         cached_page.is_dirty = True
         cached_page.page.last_modified_lsn = max(cached_page.page.last_modified_lsn, lsn)
+
+    def delete(self, page_id: int) -> None:
+        self._cache.pop(page_id, None)
 
     def flush_all(self) -> None:
         self.stats.flushes += 1

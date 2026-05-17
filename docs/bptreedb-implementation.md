@@ -1306,12 +1306,23 @@ Add a `freelist_head: int = 0` field to `MetaPage`.
 
 #### Grow `codec.py`
 
-Add a third page type tag, `0x03 FREELIST`. A freelist page is *not* a slotted page — it has a simpler layout:
+Add a third page type tag, `0x03 FREELIST`. A freelist page is *not* a slotted page — it has a simpler layout, but the 32-byte header keeps the same fixed shape as the slotted-page header so that `type_tag` can be read at a constant offset for any page in the file.
 
-- The same 32-byte page header as leaves and internal nodes, with `type_tag = 0x03` and `num_slots` repurposed to mean "number of freed page ids stored on this page." The `right_sibling_page_id` slot (offset 24) is repurposed to hold `next_freelist_page_id`, which keeps the header a single fixed shape.
-- After the header, an array of 8-byte freed page ids.
+**Freelist page header, 32 bytes:**
 
-Expose `max_freed_ids_per_freelist_page(page_size_bytes) -> int = (page_size_bytes - 32) // 8`.
+| offset | size | field              |
+|-------:|-----:|--------------------|
+|      0 |    1 | `type_tag` (0x03 freelist) |
+|      1 |    3 | reserved (zero, for alignment) |
+|      4 |    4 | `num_freed_ids` (number of freed page ids stored on this page) |
+|      8 |    4 | reserved (zero; unused on freelist pages — the slotted header's `free_space_start` lives here) |
+|     12 |    4 | reserved (zero; unused on freelist pages — the slotted header's `free_space_end` lives here) |
+|     16 |    8 | `last_modified_lsn` |
+|     24 |    8 | `next_freelist_page_id` (0 if this is the tail) |
+
+After the 32-byte header, an array of 8-byte freed page ids packed contiguously: `freed_page_id_0(8) | freed_page_id_1(8) | ... | freed_page_id_{num_freed_ids - 1}(8)`, starting at offset 32. The bytes from offset `32 + 8 * num_freed_ids` to `page_size_bytes` are unused; the encoder zero-pads them and the decoder ignores them. As with slotted pages, freelist pages carry no per-page checksum — they are protected by the WAL.
+
+Expose `max_freed_ids_per_freelist_page(page_size_bytes) -> int = (page_size_bytes - 32) // 8`. For `page_size_bytes = 4096` this is 508 freed ids per freelist page.
 
 Extend `encode_page` and `decode_page` to dispatch on `type_tag` and handle `FreelistPage` as a third case. Update `encode_meta_page` / `decode_meta_page` to include `freelist_head`; the total header grows from 44 bytes (iteration 5) to 52 bytes.
 
@@ -1319,21 +1330,48 @@ Also: in `codec.encode_wal_record`'s CHECKPOINT branch, populate the `freelist_h
 
 #### Grow `pager.py`
 
-Modify `allocate_page` and add `free_page`:
+Modify `allocate_page` and add `free_page`. Both methods read and write freelist pages directly through the pager (`read_page` / `codec.decode_page` to load, `codec.encode_page` / `write_page` to store) — freelist pages are not buffer-pooled, just like the meta page is not buffer-pooled.
 
-- `allocate_page() -> int`:
-  - If `meta.freelist_head != 0`, read the head freelist page, pop one id from its array, write the page back. If the head becomes empty, advance `meta.freelist_head` to its `next_freelist_page_id` and free the now-empty freelist page (push it to the new head — but **bump-allocate any new freelist pages directly**, never via the freelist itself, to break the circular dependency).
-  - Otherwise bump-allocate from `meta.next_page_id` and grow the data file by one page.
-  - In either case, mark the meta dirty.
-- `free_page(page_id)`:
-  - Read the head freelist page (or, if `freelist_head == 0`, bump-allocate a new freelist page and set it as the head).
-  - If the head has room, append the page id and write it back.
-  - If the head is full, bump-allocate a new freelist page, link it to the old head (`new.next = freelist_head`), set `meta.freelist_head = new_id`, and append the freed id to the new head.
-  - Mark the meta dirty.
+The single helper you'll want for both methods:
 
-The "always bump-allocate freelist pages" rule is the load-bearing simplification. Without it, the freelist allocation logic becomes recursive in unpleasant ways. Document it inline as a comment.
+```
+def bump_allocate_one_page() -> int:
+    new_id = meta.next_page_id
+    update_meta(next_page_id=new_id + 1)
+    extend the data file by one zero-filled page
+    return new_id
+```
 
-In the tree, the existing `delete` code already had a "free this page" point (the merge case). Until now that point was a TODO; now it calls `pager.free_page(merged_out_page_id)`.
+This is the *only* place in the codebase that grows the file. Neither `allocate_page` nor `free_page` ever extends the file by any other route.
+
+**`allocate_page() -> int`** has three cases, evaluated in order:
+
+1. **Pop a freed id from the head freelist page.** If `meta.freelist_head != 0`, decode the head freelist page. If its `freed_page_ids` array is non-empty, pop the last id, re-encode the freelist page, write it back, and return the popped id.
+
+2. **Recycle an exhausted head.** If `meta.freelist_head != 0` and the head's `freed_page_ids` array is empty: the head freelist page is no longer carrying any freed ids, so its *own* page id is what we hand back. Set `meta.freelist_head = head.next_freelist_page_id` and return the old `meta.freelist_head`. This works uniformly whether the chain had a successor or not — if `head.next_freelist_page_id == 0`, the freelist correctly transitions to "empty" (no freelist page exists) and a future `free_page` will rebuild it from scratch. No file growth is needed in either subcase.
+
+3. **Bump-allocate.** Otherwise (`meta.freelist_head == 0`, i.e. the freelist is already empty), call `bump_allocate_one_page()` and return its result. This is the only case that grows the file.
+
+`update_meta` already marks the meta dirty, so any case that touches `meta.freelist_head` or `meta.next_page_id` is covered.
+
+**`free_page(page_id) -> None`** has three symmetric cases:
+
+1. **First-ever free: no freelist yet.** If `meta.freelist_head == 0`, call `bump_allocate_one_page()` to get a fresh page id `new_id`. Build a `FreelistPage` with `next_freelist_page_id = 0`, `freed_page_ids = [page_id]`, and `last_modified_lsn = 0` (this field is decorative on freelist pages — they aren't buffer-pooled, so always pass `0` here and in case 3); encode it, write it to `new_id`. Set `meta.freelist_head = new_id` via `update_meta`.
+
+2. **Head has room.** Otherwise, decode the head freelist page. If `len(head.freed_page_ids) < max_freed_ids_per_freelist_page(page_size_bytes)`, append `page_id` to the array, re-encode, write back.
+
+3. **Head is full.** Otherwise, call `bump_allocate_one_page()` to get `new_id`. Build a `FreelistPage` with `next_freelist_page_id = meta.freelist_head` (link the old head behind it) and `freed_page_ids = [page_id]`, encode, write to `new_id`. Set `meta.freelist_head = new_id` via `update_meta`.
+
+**The "bump-allocate new freelist pages directly" rule.** In cases 1 and 3 of `free_page`, the new freelist page comes from `bump_allocate_one_page()` — *not* from `allocate_page`. The reason is the obvious one: `free_page` is the method that *gives* pages to the freelist, and `allocate_page` is the method that *takes* pages from it. If `free_page` called `allocate_page` to get a new freelist page, then mid-way through freeing one page we'd be popping another from a structure we're about to mutate, and the two methods would have to reason about each other's intermediate state. Bump-allocating directly keeps the two methods on disjoint allocation paths and makes each one trivially correct on its own. Add a one-line `# Bump-allocate directly...` comment at each call site as a reminder.
+
+You may have noticed `allocate_page` never calls `free_page` either (case 2 just rewrites `meta.freelist_head` in place). That's intentional, for the same reason.
+
+In the tree, the existing `delete` code already had two "free this page" points that iteration 3 deliberately left as leaks (the spec calls them out at the merge step and the root-collapse step):
+
+1. **Merge:** after redistributing slots from the merged-out page into its sibling, call `pager.free_page(merged_out_page_id)`.
+2. **Root collapse:** after `pager.update_meta(root_page_id=root.leftmost_child_page_id)`, call `pager.free_page(old_root_page_id)`. Without this, every level the tree shrinks by leaks one internal page — a steady leak in a delete-heavy workload, since each round of mass-deletes can trigger multiple collapses.
+
+In both cases, free the page *after* the meta or sibling has been updated to no longer reference it, never before.
 
 In the WAL CHECKPOINT record, populate the `freelist_head` field with the current value (instead of the 0 placeholder from Iteration 5). The recovery procedure already reads it from the meta page, so no recovery changes are needed.
 

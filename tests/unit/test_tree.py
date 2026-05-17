@@ -438,8 +438,10 @@ def test_delete_leaf_merge_left(make_tree):
     # WHEN deleting a key from the right leaf, causing it to become underpopulated
     tree.delete(b"long_record_key_0004", 2)
 
-    # THEN the tree should self-rebalance by merging the right leaf with the middle leaf
-    assert tree.pager.page_count() == 5
+    # THEN the tree should self-rebalance by merging the right leaf with the middle leaf.
+    # The merge frees page 3; the first free in an empty freelist bump-allocates a head page,
+    # advancing next_page_id from 5 to 6.
+    assert tree.pager.page_count() == 6
     assert tree.pager.get_meta().root_page_id == 4
     assert tree.buffer_pool.get(4) == InternalPage(
         last_modified_lsn=2,
@@ -521,8 +523,10 @@ def test_delete_leaf_merge_right(make_tree):
     # WHEN deleting a key from the left leaf, causing it to become underpopulated
     tree.delete(b"long_record_key_0000", 2)
 
-    # THEN the tree should self-rebalance by merging the left leaf with the middle leaf
-    assert tree.pager.page_count() == 5
+    # THEN the tree should self-rebalance by merging the left leaf with the middle leaf.
+    # The merge frees one page; the first free in an empty freelist bump-allocates a head page,
+    # advancing next_page_id from 5 to 6.
+    assert tree.pager.page_count() == 6
     assert tree.pager.get_meta().root_page_id == 4
     assert tree.buffer_pool.get(4) == InternalPage(
         last_modified_lsn=2,
@@ -607,8 +611,10 @@ def test_delete_leaf_merge_left_at_slot_0(make_tree):
     # WHEN deleting a key from page 2, making it underpopulated
     tree.delete(b"long_record_key_0020", 2)
 
-    # THEN the underpopulated leaf (page 2) should be merged into the leftmost_child (page 1)
-    assert tree.pager.page_count() == 5
+    # THEN the underpopulated leaf (page 2) should be merged into the leftmost_child (page 1).
+    # The merge frees page 2; the first free in an empty freelist bump-allocates a head page,
+    # advancing next_page_id from 5 to 6.
+    assert tree.pager.page_count() == 6
     assert tree.pager.get_meta().root_page_id == 4
     assert tree.buffer_pool.get(4) == InternalPage(
         last_modified_lsn=2,
@@ -689,8 +695,10 @@ def test_delete_leaf_merge_and_root_collapse(make_tree):
     # WHEN deleting a key from the left child, causing it to become underpopulated
     tree.delete(b"long_record_key_0000", 2)
 
-    # THEN the tree should self-rebalance by merging the leaf nodes and collapsing the root
-    assert tree.pager.page_count() == 4
+    # THEN the tree should self-rebalance by merging the leaf nodes and collapsing the root.
+    # Two pages are freed (merged sibling + collapsed root); the first free bump-allocates a
+    # freelist head page, the second appends to it, so next_page_id advances from 4 to 5.
+    assert tree.pager.page_count() == 5
     assert tree.pager.get_meta().root_page_id == 1
     assert tree.buffer_pool.get(1) == LeafPage(
         last_modified_lsn=2,
@@ -702,6 +710,63 @@ def test_delete_leaf_merge_and_root_collapse(make_tree):
         ],
     )
     assert_tree_invariants(tree)
+
+
+def test_delete_merge_recycles_freed_page_id(make_tree):
+    # GIVEN the same 2-level tree as the merge-and-collapse case
+    pages = [
+        (
+            3,
+            InternalPage(
+                last_modified_lsn=1,
+                leftmost_child_page_id=1,
+                slots=[InternalSlot(key=b"long_record_key_0002", child_page_id=2)],
+            ),
+        ),
+        (
+            1,
+            LeafPage(
+                last_modified_lsn=1,
+                right_sibling_page_id=2,
+                slots=[
+                    LeafSlot(key=b"long_record_key_0000", value=b"v000"),
+                    LeafSlot(key=b"long_record_key_0001", value=b"v001"),
+                ],
+            ),
+        ),
+        (
+            2,
+            LeafPage(
+                last_modified_lsn=1,
+                right_sibling_page_id=0,
+                slots=[
+                    LeafSlot(key=b"long_record_key_0002", value=b"v002"),
+                    LeafSlot(key=b"long_record_key_0003", value=b"v003"),
+                ],
+            ),
+        ),
+    ]
+    tree = make_tree(pages=pages, root_page_id=3)
+
+    # WHEN the delete triggers a merge (frees page 2) and a root collapse (frees page 3)
+    tree.delete(b"long_record_key_0000", 2)
+
+    # THEN a fresh allocation returns one of the freed ids, not a bump-allocated id.
+    # Frees ran in order [2, 3]; pop is LIFO, so 3 comes back first.
+    next_alloc = tree.pager.allocate_page()
+    assert next_alloc == 3
+    next_alloc = tree.pager.allocate_page()
+    assert next_alloc == 2
+
+    # THEN the buffer pool tolerated the same id being re-handed-out.
+    # If buffer_pool.delete had been omitted, the cached (formerly dirty) entry for page 2
+    # or 3 would still be present, and a subsequent insert at that id would assert.
+    tree.buffer_pool.insert(
+        2, LeafPage(last_modified_lsn=10, right_sibling_page_id=0, slots=[]), 10
+    )
+    tree.buffer_pool.insert(
+        3, LeafPage(last_modified_lsn=10, right_sibling_page_id=0, slots=[]), 10
+    )
 
 
 def test_delete_cascades_into_internal_redistribute(make_tree):

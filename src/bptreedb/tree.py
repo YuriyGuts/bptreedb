@@ -447,10 +447,12 @@ class BPlusTree:
             is_left_sibling = sibling_page.slots[-1].key < page.slots[0].key
             if is_left_sibling:
                 merge_left_page_id = sibling_page_id
+                merge_right_page_id = page_id
                 merge_left_page = sibling_page.copy()
                 merge_right_page = page.copy()
             else:
                 merge_left_page_id = page_id
+                merge_right_page_id = sibling_page_id
                 merge_left_page = page.copy()
                 merge_right_page = sibling_page.copy()
 
@@ -492,6 +494,8 @@ class BPlusTree:
 
             self.buffer_pool.mark_dirty(merge_left_page_id, lsn)
             self.buffer_pool.mark_dirty(parent_page_id, lsn)
+            self.buffer_pool.delete(merge_right_page_id)
+            self.pager.free_page(merge_right_page_id)
 
             if isinstance(merge_left_page, LeafPage):
                 self.stats.leaf_merges += 1
@@ -500,7 +504,10 @@ class BPlusTree:
 
             # If we've just merged the only remaining leaves in the tree, collapse the root.
             if not parent_page.slots and parent_page_id == self.root_page_id:
+                old_root_id = self.root_page_id
                 self.pager.update_meta(root_page_id=parent_page.leftmost_child_page_id)
+                self.buffer_pool.delete(old_root_id)
+                self.pager.free_page(old_root_id)
                 self.stats.root_collapses += 1
                 return None
 

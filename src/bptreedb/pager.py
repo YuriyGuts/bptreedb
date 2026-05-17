@@ -8,8 +8,11 @@ from typing import Self
 
 from bptreedb.codec import MIN_PAGE_SIZE
 from bptreedb.codec import decode_meta_page
+from bptreedb.codec import decode_page
 from bptreedb.codec import encode_meta_page
 from bptreedb.codec import encode_page
+from bptreedb.codec import get_max_freed_ids_per_freelist_page
+from bptreedb.entities import FreelistPage
 from bptreedb.entities import LeafPage
 from bptreedb.entities import MetaPage
 from bptreedb.exceptions import DBCorruptedError
@@ -69,6 +72,7 @@ class Pager:
             page_size_bytes=self.page_size_bytes,
             root_page_id=DEFAULT_ROOT_PAGE_ID,
             next_page_id=DEFAULT_ROOT_PAGE_ID,
+            freelist_head_page_id=0,
             last_checkpoint_lsn=0,
         )
         leaf_page_id = self.allocate_page()
@@ -110,6 +114,12 @@ class Pager:
         self._file.seek(0, io.SEEK_END)
         self._file.write(bytes(self.page_size_bytes))
 
+    def _read_freelist_head_page(self) -> FreelistPage:
+        assert self._meta_page is not None
+        page = decode_page(self.read_page(self._meta_page.freelist_head_page_id))
+        assert isinstance(page, FreelistPage)
+        return page
+
     def read_page(self, page_id: int) -> bytes:
         assert self._file is not None
         self._file.seek(page_id * self.page_size_bytes)
@@ -146,10 +156,61 @@ class Pager:
         self._is_meta_dirty = False
         self.stats.meta_flushes += 1
 
-    def allocate_page(self) -> int:
+    def _bump_allocate_one_page(self) -> int:
         assert self._meta_page is not None
         page_id = self._meta_page.next_page_id
         self._extend_file_by_one_page()
         self.update_meta(next_page_id=page_id + 1)
         self.stats.pages_allocated += 1
         return page_id
+
+    def allocate_page(self) -> int:
+        assert self._meta_page is not None
+
+        # Is there a page in the freelist we can reuse?
+        if self._meta_page.freelist_head_page_id != 0:
+            freelist_page = self._read_freelist_head_page()
+            assert isinstance(freelist_page, FreelistPage)
+
+            # Freelist has a page available.
+            if freelist_page.freed_page_ids:
+                page_id = freelist_page.freed_page_ids.pop()
+                self.write_page(
+                    self._meta_page.freelist_head_page_id,
+                    encode_page(freelist_page, self.page_size_bytes),
+                )
+                return page_id
+
+            # Freelist head page is exhausted: recycle it for allocation and update the freelist
+            # pointer to a successor page if available.
+            page_id = self._meta_page.freelist_head_page_id
+            self.update_meta(freelist_head_page_id=freelist_page.next_freelist_page_id)
+            return page_id
+
+        # Freelist is unavailable or exhausted: bump-allocate a new page.
+        return self._bump_allocate_one_page()
+
+    def free_page(self, page_id: int) -> None:
+        assert self._meta_page is not None
+
+        # If we already have a freelist head page which has room for one more entry, use it.
+        if self._meta_page.freelist_head_page_id != 0:
+            freelist_page = self._read_freelist_head_page()
+            max_entries = get_max_freed_ids_per_freelist_page(self.page_size_bytes)
+            if len(freelist_page.freed_page_ids) < max_entries:
+                freelist_page.freed_page_ids.append(page_id)
+                self.write_page(
+                    self._meta_page.freelist_head_page_id,
+                    encode_page(freelist_page, self.page_size_bytes),
+                )
+                return
+
+        # Otherwise, bump-allocate a new freelist head page.
+        new_head_page_id = self._bump_allocate_one_page()
+        freelist_page = FreelistPage(
+            last_modified_lsn=0,
+            next_freelist_page_id=self._meta_page.freelist_head_page_id,
+            freed_page_ids=[page_id],
+        )
+        self.write_page(new_head_page_id, encode_page(freelist_page, self.page_size_bytes))
+        self.update_meta(freelist_head_page_id=new_head_page_id)

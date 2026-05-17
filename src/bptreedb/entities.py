@@ -32,6 +32,7 @@ class MetaPage:
     page_size_bytes: int
     root_page_id: int
     next_page_id: int
+    freelist_head_page_id: int
     last_checkpoint_lsn: int
 
     def copy(self) -> MetaPage:
@@ -68,3 +69,10 @@ class LeafPage:
 
     def copy(self) -> LeafPage:
         return copy.deepcopy(self)
+
+
+@dataclass
+class FreelistPage:
+    last_modified_lsn: int
+    next_freelist_page_id: int
+    freed_page_ids: list[int]

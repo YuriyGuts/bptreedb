@@ -6,6 +6,7 @@ from struct import Struct
 from typing import IO
 from typing import Any
 
+from bptreedb.entities import FreelistPage
 from bptreedb.entities import InternalPage
 from bptreedb.entities import InternalSlot
 from bptreedb.entities import LeafPage
@@ -25,7 +26,7 @@ _CRC32_FIELD = _UINT32_FIELD
 _PAGE_ID_FIELD = _UINT64_FIELD
 
 _WAL_RECORD_HEADER = Struct("<QB")
-_META_PAGE_NO_CRC = Struct("<8sIIQQQ")
+_META_PAGE_NO_CRC = Struct("<8sIIQQQQ")
 _PAGE_HEADER = Struct("<B3sIIIQQ")
 _SLOT_ENTRY = Struct("<II")
 
@@ -123,6 +124,7 @@ class WALOperationType(IntEnum):
 class PageType(IntEnum):
     INTERNAL = 0x01
     LEAF = 0x02
+    FREELIST = 0x03
 
 
 def verify_crc32(data: bytes) -> None:
@@ -217,6 +219,7 @@ def encode_meta_page(page: MetaPage) -> bytes:
         page.page_size_bytes,
         page.root_page_id,
         page.next_page_id,
+        page.freelist_head_page_id,
         page.last_checkpoint_lsn,
     )
     writer.write_crc32()
@@ -237,68 +240,85 @@ def decode_meta_page(data: bytes) -> MetaPage:
         page_size_bytes=unpacked[2],
         root_page_id=unpacked[3],
         next_page_id=unpacked[4],
-        last_checkpoint_lsn=unpacked[5],
+        freelist_head_page_id=unpacked[5],
+        last_checkpoint_lsn=unpacked[6],
     )
 
 
-def encode_page(page: InternalPage | LeafPage, page_size_bytes: int) -> bytes:
+def encode_page(page: InternalPage | LeafPage | FreelistPage, page_size_bytes: int) -> bytes:
     page_buffer = bytearray(page_size_bytes)
     record_end_ptr = len(page_buffer)
-    slot_writer = BufferWriter()
-
-    for slot in page.slots:
-        record_writer = BufferWriter()
-        match slot:
-            case InternalSlot():
-                record_writer.write_length_prefixed_bytes(slot.key)
-                record_writer.write_struct(_PAGE_ID_FIELD, slot.child_page_id)
-            case LeafSlot():
-                record_writer.write_length_prefixed_bytes(slot.key)
-                record_writer.write_length_prefixed_bytes(slot.value)
-            case _:
-                raise ValueError(f"Unknown slot type {slot}")
-
-        record = bytes(record_writer)
-        record_end_ptr -= len(record)
-        page_buffer[record_end_ptr : record_end_ptr + len(record)] = record
-        slot_writer.write_struct(_SLOT_ENTRY, record_end_ptr, len(record))
 
     match page:
         case InternalPage():
             page_type = PageType.INTERNAL
             page_id_field_value = page.leftmost_child_page_id
+            count_value = len(page.slots)
         case LeafPage():
             page_type = PageType.LEAF
             page_id_field_value = page.right_sibling_page_id
+            count_value = len(page.slots)
+        case FreelistPage():
+            page_type = PageType.FREELIST
+            page_id_field_value = page.next_freelist_page_id
+            count_value = len(page.freed_page_ids)
         case _:
             raise ValueError(f"Unknown page type {page}")
 
-    free_space_start = _PAGE_HEADER.size + _SLOT_ENTRY.size * len(page.slots)
-    free_space_end = record_end_ptr
+    match page:
+        case InternalPage() | LeafPage():
+            slot_writer = BufferWriter()
+            for slot in page.slots:
+                record_writer = BufferWriter()
+                match slot:
+                    case InternalSlot():
+                        record_writer.write_length_prefixed_bytes(slot.key)
+                        record_writer.write_struct(_PAGE_ID_FIELD, slot.child_page_id)
+                    case LeafSlot():
+                        record_writer.write_length_prefixed_bytes(slot.key)
+                        record_writer.write_length_prefixed_bytes(slot.value)
+                    case _:
+                        raise ValueError(f"Unknown slot type {slot}")
+                record = bytes(record_writer)
+                record_end_ptr -= len(record)
+                page_buffer[record_end_ptr : record_end_ptr + len(record)] = record
+                slot_writer.write_struct(_SLOT_ENTRY, record_end_ptr, len(record))
+
+            encoded_records = bytes(slot_writer)
+            free_space_start = _PAGE_HEADER.size + _SLOT_ENTRY.size * len(page.slots)
+            free_space_end = record_end_ptr
+        case FreelistPage():
+            freed_id_list_writer = BufferWriter()
+            for page_id in page.freed_page_ids:
+                freed_id_list_writer.write_struct(_PAGE_ID_FIELD, page_id)
+
+            encoded_records = bytes(freed_id_list_writer)
+            free_space_start = free_space_end = 0
+        case _:
+            raise ValueError(f"Unknown page type {page}")
 
     header_writer = BufferWriter()
     header_writer.write_struct(
         _PAGE_HEADER,
         page_type,
         bytes(3),
-        len(page.slots),
+        count_value,
         free_space_start,
         free_space_end,
         page.last_modified_lsn,
         page_id_field_value,
     )
-
     page_buffer[0 : len(header_writer)] = bytes(header_writer)
-    page_buffer[len(header_writer) : len(header_writer) + len(slot_writer)] = bytes(slot_writer)
+    page_buffer[len(header_writer) : len(header_writer) + len(encoded_records)] = encoded_records
     return bytes(page_buffer)
 
 
-def decode_page(data: bytes) -> InternalPage | LeafPage:
+def decode_page(data: bytes) -> InternalPage | LeafPage | FreelistPage:
     reader = BufferReader(data)
     (
         page_type,
         _,
-        slot_count,
+        count_value,
         free_space_start,
         free_space_end,
         last_modified_lsn,
@@ -307,7 +327,7 @@ def decode_page(data: bytes) -> InternalPage | LeafPage:
     match page_type:
         case PageType.INTERNAL:
             slots = []
-            for _ in range(slot_count):
+            for _ in range(count_value):
                 record_offset, record_length = reader.read_struct(_SLOT_ENTRY)
                 record = data[record_offset : record_offset + record_length]
                 record_reader = BufferReader(record)
@@ -321,7 +341,7 @@ def decode_page(data: bytes) -> InternalPage | LeafPage:
             )
         case PageType.LEAF:
             slots = []
-            for _ in range(slot_count):
+            for _ in range(count_value):
                 record_offset, record_length = reader.read_struct(_SLOT_ENTRY)
                 record = data[record_offset : record_offset + record_length]
                 record_reader = BufferReader(record)
@@ -332,6 +352,16 @@ def decode_page(data: bytes) -> InternalPage | LeafPage:
                 last_modified_lsn=last_modified_lsn,
                 right_sibling_page_id=page_id_field_value,
                 slots=slots,
+            )
+        case PageType.FREELIST:
+            freed_page_ids = []
+            for _ in range(count_value):
+                page_id = reader.read_struct(_PAGE_ID_FIELD)[0]
+                freed_page_ids.append(page_id)
+            return FreelistPage(
+                last_modified_lsn=last_modified_lsn,
+                next_freelist_page_id=page_id_field_value,
+                freed_page_ids=freed_page_ids,
             )
         case _:
             raise ValueError(f"Unknown page type {page_type}")
@@ -363,3 +393,7 @@ def get_max_leaf_record_size(page_size_bytes: int) -> int:
     # The 20% cap (not 25%) ensures that no single slot is large enough to force a split into
     # underpopulated half-pages which are impossible to balance without introducing new techniques.
     return (page_size_bytes - _PAGE_HEADER.size) // 5 - _SLOT_ENTRY.size
+
+
+def get_max_freed_ids_per_freelist_page(page_size_bytes: int) -> int:
+    return (page_size_bytes - 32) // 8

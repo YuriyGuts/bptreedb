@@ -157,6 +157,52 @@ def test_mark_dirty_updates_to_highest_lsn(mock_pager):
     assert pool.get(4).last_modified_lsn == 5
 
 
+def test_delete_removes_entry(mock_pager):
+    # GIVEN a buffer pool holding a dirty page
+    pool = BufferPool(pager=mock_pager, capacity_pages=3)
+    pool.get(1)
+    pool.mark_dirty(1, 5)
+    assert list(pool._cache) == [1]
+    assert pool.dirty_count == 1
+
+    # WHEN deleting the page
+    pool.delete(1)
+
+    # THEN the entry is gone and the dirty bookkeeping reflects it
+    assert list(pool._cache) == []
+    assert pool.dirty_count == 0
+    assert pool.get_dirty_page_ids() == []
+
+
+def test_delete_missing_is_noop(mock_pager):
+    # GIVEN a buffer pool with one page
+    pool = BufferPool(pager=mock_pager, capacity_pages=3)
+    pool.get(1)
+
+    # WHEN deleting an id that was never cached
+    pool.delete(99)
+
+    # THEN the existing entry is untouched
+    assert list(pool._cache) == [1]
+
+
+def test_delete_then_insert_same_id(mock_pager):
+    # GIVEN a buffer pool with a dirty page that's about to be freed and reused
+    pool = BufferPool(pager=mock_pager, capacity_pages=3)
+    pool.get(2)
+    pool.mark_dirty(2, 5)
+
+    # WHEN deleting the entry, then inserting a fresh page at the same id
+    pool.delete(2)
+    fresh = LeafPage(last_modified_lsn=0, right_sibling_page_id=0, slots=[])
+    pool.insert(2, fresh, 10)
+
+    # THEN the new page is the one seen by the pool, with the new LSN
+    assert pool.get(2) is fresh
+    assert pool.get(2).last_modified_lsn == 10
+    assert pool.get_dirty_page_ids() == [2]
+
+
 def test_flush_all_clean(mock_pager):
     # GIVEN a buffer pool full of clean pages
     pool = BufferPool(pager=mock_pager, capacity_pages=3)

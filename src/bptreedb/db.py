@@ -205,7 +205,7 @@ class DB:
         meta = self.pager.get_meta()
         self.wal.append_checkpoint(
             root_page_id=meta.root_page_id,
-            freelist_head=0,
+            freelist_head=meta.freelist_head_page_id,
             next_page_id=meta.next_page_id,
         )
         self.pager.update_meta(last_checkpoint_lsn=checkpoint_lsn)
