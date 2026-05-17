@@ -493,8 +493,8 @@ class BPlusTree:
         total_body = slot_cumulative_sizes[-1]
         byte_midpoint = bisect.bisect_right(slot_cumulative_sizes, total_body // 2)
 
-        # Try the byte midpoint first, then scan outward.
-        # The first balanced index wins. If none balance, fall back to the byte midpoint.
+        # Walk outward from the byte midpoint (+1, -1, +2, -2, ...) and take the first
+        # candidate that balances; fall back to the midpoint if none do.
         slot_count = len(slot_cumulative_sizes)
         offsets = [0]
         for offset in range(1, slot_count):
@@ -641,16 +641,20 @@ class BPlusTree:
         assert isinstance(parent_slot_idx, int)
 
         sibling_info = self._determine_same_parent_siblings(parent_page, parent_slot_idx)
-        for sibling_page_id, sibling_page in sibling_info:
-            if not sibling_page:
+
+        # Try redistributing slots from a sibling first.
+        for pos_idx, (sibling_page_id, sibling_page) in enumerate(sibling_info):
+            if sibling_page is None:
                 continue
 
-            is_left_sibling = sibling_page.slots[-1].key < page.slots[0].key
+            donor_is_left = pos_idx == 0
+            separator_idx = parent_slot_idx if donor_is_left else parent_slot_idx + 1
             if self._try_redistribute_slots(
                 donor_page=sibling_page,
                 recipient_page=page,
                 parent_page=parent_page,
-                parent_slot_idx=parent_slot_idx if is_left_sibling else parent_slot_idx + 1,
+                parent_separator_idx=separator_idx,
+                donor_is_left=donor_is_left,
             ):
                 self.buffer_pool.mark_dirty(page_id, lsn)
                 self.buffer_pool.mark_dirty(sibling_page_id, lsn)
@@ -672,66 +676,63 @@ class BPlusTree:
                 self.buffer_pool.mark_dirty(parent_page_id, lsn)
                 return None
 
-        # If we cannot just redistribute sibling slots, we have to merge sibling pages.
-        for sibling_page_id, sibling_page in sibling_info:
-            if not sibling_page:
+        # Redistribution didn't work, fall through to merging. We always merge into the left page.
+        for pos_idx, (sibling_page_id, sibling_page) in enumerate(sibling_info):
+            if sibling_page is None:
                 continue
 
-            # We always merge the right page into the left page, then keep the left page.
-            is_left_sibling = sibling_page.slots[-1].key < page.slots[0].key
-            if is_left_sibling:
-                merge_left_page_id = sibling_page_id
-                merge_right_page_id = page_id
-                merge_left_page = sibling_page.copy()
-                merge_right_page = page.copy()
+            sibling_is_left = pos_idx == 0
+            if sibling_is_left:
+                merge_into_page_id, merge_from_page_id = sibling_page_id, page_id
+                merge_into_page, merge_from_page = sibling_page, page
+                separator_idx = parent_slot_idx
             else:
-                merge_left_page_id = page_id
-                merge_right_page_id = sibling_page_id
-                merge_left_page = page.copy()
-                merge_right_page = sibling_page.copy()
+                merge_into_page_id, merge_from_page_id = page_id, sibling_page_id
+                merge_into_page, merge_from_page = page, sibling_page
+                separator_idx = parent_slot_idx + 1
 
-            match merge_left_page:
-                case LeafPage():
-                    assert isinstance(merge_right_page, LeafPage)
-                    merge_left_page.slots += merge_right_page.slots
-                    merge_left_page.right_sibling_page_id = merge_right_page.right_sibling_page_id
-                case InternalPage():
-                    # Pull down the separator from the parent.
-                    assert isinstance(merge_right_page, InternalPage)
-                    parent_slot = (
-                        parent_page.slots[parent_slot_idx]
-                        if is_left_sibling
-                        else parent_page.slots[parent_slot_idx + 1]
-                    )
-                    merge_left_page.slots.append(
-                        InternalSlot(
-                            key=parent_slot.key,
-                            child_page_id=merge_right_page.leftmost_child_page_id,
-                        )
-                    )
-                    merge_left_page.slots += merge_right_page.slots
-                case _:
-                    raise ValueError(f"Unexpected page type: {type(merge_left_page).__name__}")
+            # Build a probe page first so we can bail if the merge would overflow,
+            # without leaving the originals half-mutated.
+            probe: LeafPage | InternalPage
+            if isinstance(merge_into_page, LeafPage):
+                assert isinstance(merge_from_page, LeafPage)
+                probe = LeafPage(
+                    last_modified_lsn=0,
+                    right_sibling_page_id=merge_from_page.right_sibling_page_id,
+                    slots=merge_into_page.slots + merge_from_page.slots,
+                )
+            else:
+                assert isinstance(merge_into_page, InternalPage)
+                assert isinstance(merge_from_page, InternalPage)
+                pulled_down = InternalSlot(
+                    key=parent_page.slots[separator_idx].key,
+                    child_page_id=merge_from_page.leftmost_child_page_id,
+                )
+                probe = InternalPage(
+                    last_modified_lsn=0,
+                    leftmost_child_page_id=merge_into_page.leftmost_child_page_id,
+                    slots=merge_into_page.slots + [pulled_down] + merge_from_page.slots,
+                )
 
-            # Can we merge with this sibling without overflowing the page?
-            if calculate_page_size(merge_left_page) > self.page_size_bytes:
+            if calculate_page_size(probe) > self.page_size_bytes:
                 continue
 
-            # Remove the separator that used to point at the merged-away page.
-            parent_page.slots.pop(parent_slot_idx if is_left_sibling else parent_slot_idx + 1)
-
-            # Apply the changes in-place to the original pages tracked by the buffer pool.
-            if is_left_sibling:
-                sibling_page.__dict__.update(merge_left_page.__dict__)
+            # Apply the merged content to the surviving page and drop the parent's separator.
+            if isinstance(merge_into_page, LeafPage):
+                assert isinstance(probe, LeafPage)
+                merge_into_page.slots = probe.slots
+                merge_into_page.right_sibling_page_id = probe.right_sibling_page_id
             else:
-                page.__dict__.update(merge_left_page.__dict__)
+                assert isinstance(probe, InternalPage)
+                merge_into_page.slots = probe.slots
+            parent_page.slots.pop(separator_idx)
 
-            self.buffer_pool.mark_dirty(merge_left_page_id, lsn)
+            self.buffer_pool.mark_dirty(merge_into_page_id, lsn)
             self.buffer_pool.mark_dirty(parent_page_id, lsn)
-            self.buffer_pool.delete(merge_right_page_id)
-            self.pager.free_page(merge_right_page_id)
+            self.buffer_pool.delete(merge_from_page_id)
+            self.pager.free_page(merge_from_page_id)
 
-            if isinstance(merge_left_page, LeafPage):
+            if isinstance(merge_into_page, LeafPage):
                 self.stats.leaf_merges += 1
             else:
                 self.stats.internal_merges += 1
@@ -747,6 +748,8 @@ class BPlusTree:
 
             return parent_page_id, parent_page
 
+        # Unreachable: the `page_size / 5` record cap bounds both pages below 40% and the
+        # pulled-down separator below ~20%, so two underpopulated pages always fit together.
         msg = "Expected to either redistribute or merge the pages. This should not happen."
         raise AssertionError(msg)
 
@@ -755,7 +758,8 @@ class BPlusTree:
         donor_page: LeafPage | InternalPage,
         recipient_page: LeafPage | InternalPage,
         parent_page: InternalPage,
-        parent_slot_idx: int,
+        parent_separator_idx: int,
+        donor_is_left: bool,
     ) -> bool:
         """
         Move slots from `donor_page` into `recipient_page` until the recipient is healthy.
@@ -768,16 +772,17 @@ class BPlusTree:
             The underpopulated page being rescued.
         parent_page
             The shared parent of both siblings.
-        parent_slot_idx
+        parent_separator_idx
             Slot index inside `parent_page` whose separator key gets rewritten during transfer.
+        donor_is_left
+            True if `donor_page` sits to the left of `recipient_page` under the shared parent.
 
         Returns
         -------
         `True` on success. If the donor would itself fall below the threshold during the
         transfer, the operation is rolled back and `False` is returned.
         """
-        donor_is_left = donor_page.slots[-1].key < recipient_page.slots[0].key
-        parent_slot = parent_page.slots[parent_slot_idx]
+        parent_slot = parent_page.slots[parent_separator_idx]
 
         donor_backup = donor_page.copy()
         recipient_backup = recipient_page.copy()

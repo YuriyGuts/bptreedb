@@ -1,6 +1,8 @@
 """LRU buffer pool that sits between the B+ tree and the pager."""
 
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from bptreedb.codec import decode_page
@@ -54,9 +56,24 @@ class BufferPool:
         """
         self.pager = pager
         self.capacity_pages = capacity_pages
-        self.enable_eviction = True
         self.stats = BufferPoolStats()
         self._cache: OrderedDict[int, CachedPage] = OrderedDict()
+        self._eviction_enabled = True
+
+    @contextmanager
+    def eviction_disabled(self) -> Iterator[None]:
+        """
+        Disable LRU eviction for the duration of the `with` block.
+
+        Recovery uses this so a partially-replayed WAL sequence cannot trigger an eviction
+        that would flush half-applied tree state to disk before the next record completes.
+        """
+        previous = self._eviction_enabled
+        self._eviction_enabled = False
+        try:
+            yield
+        finally:
+            self._eviction_enabled = previous
 
     @property
     def dirty_count(self) -> int:
@@ -174,7 +191,7 @@ class BufferPool:
         DBBufferPoolOverflowError
             If the pool is at capacity and every cached page is dirty.
         """
-        if not self.enable_eviction:
+        if not self._eviction_enabled:
             return
 
         if len(self._cache) >= self.capacity_pages:

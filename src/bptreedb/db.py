@@ -12,7 +12,6 @@ from bptreedb.entities import WALCheckpointRecord
 from bptreedb.entities import WALDeleteRecord
 from bptreedb.entities import WALPutRecord
 from bptreedb.entities import WALRecord
-from bptreedb.exceptions import DBBufferPoolOverflowError
 from bptreedb.exceptions import DBClosedError
 from bptreedb.exceptions import DBConcurrentPageModificationError
 from bptreedb.fs import fsync_directory
@@ -77,17 +76,41 @@ class DB:
         self.pager.open()
         self.wal.open()
         try:
-            self.buffer_pool.enable_eviction = False
-            self._recovery_last_checkpoint_lsn = self.pager.get_meta().last_checkpoint_lsn
-            self.wal.replay(self._apply_wal_record)
-            self.buffer_pool.enable_eviction = True
-            self.checkpoint()
+            self._recover()
         except Exception:
             self.wal.close()
             self.pager.close()
             raise
 
         self.is_opened = True
+
+    def _recover(self) -> None:
+        """Recover the database state from the WAL."""
+        with self.buffer_pool.eviction_disabled():
+            self._repair_pager_meta_from_wal_checkpoint()
+            self._recovery_last_checkpoint_lsn = self.pager.get_meta().last_checkpoint_lsn
+            self.wal.replay(self._apply_wal_record)
+        self.checkpoint()
+
+    def _repair_pager_meta_from_wal_checkpoint(self) -> None:
+        """Advance the in-memory pager meta if the WAL has a newer CHECKPOINT than the disk meta."""
+        on_disk_last_checkpoint_lsn = self.pager.get_meta().last_checkpoint_lsn
+        latest_checkpoint: WALCheckpointRecord | None = None
+        for record in self.wal.peek_records():
+            if isinstance(record, WALCheckpointRecord) and (
+                latest_checkpoint is None or record.lsn > latest_checkpoint.lsn
+            ):
+                latest_checkpoint = record
+
+        if latest_checkpoint is None or latest_checkpoint.lsn <= on_disk_last_checkpoint_lsn:
+            return
+
+        self.pager.update_meta(
+            root_page_id=latest_checkpoint.root_page_id,
+            freelist_head_page_id=latest_checkpoint.freelist_head,
+            next_page_id=latest_checkpoint.next_page_id,
+            last_checkpoint_lsn=latest_checkpoint.lsn,
+        )
 
     def close(self) -> None:
         """Take a final checkpoint and release all underlying file handles."""
@@ -157,7 +180,7 @@ class DB:
         if not isinstance(value, bytes):
             raise TypeError(f"{param_name} must have the bytes type")
 
-    def _maybe_checkpoint_after_write(self) -> None:
+    def _maybe_checkpoint(self) -> None:
         """Trigger a checkpoint if the WAL or the dirty page ratio crossed the configured limit."""
         should_checkpoint = (
             self.wal.size_bytes > self.checkpoint_wal_size_bytes
@@ -181,15 +204,16 @@ class DB:
         self._ensure_bytes_type(key, "key")
         self._ensure_bytes_type(value, "value")
 
+        # Make sure the buffer pool has room for the pages that may be touched by tree rebalancing.
+        # `tree.insert` is not transactional, so a pool overflow during rebalance would leave the
+        # tree in a half-mutated state we cannot recover from.
+        self._maybe_checkpoint()
+
         lsn = self.wal.append_put(key, value)
-        try:
-            self.tree.insert(key, value, lsn)
-        except DBBufferPoolOverflowError:
-            self.checkpoint()
-            self.tree.insert(key, value, lsn)
+        self.tree.insert(key, value, lsn)
 
         self._version_counter += 1
-        self._maybe_checkpoint_after_write()
+        self._maybe_checkpoint()
 
     def get(self, key: bytes) -> bytes | None:
         """
@@ -226,15 +250,15 @@ class DB:
         if self.tree.search(key) is None:
             return False
 
+        # Make sure the buffer pool has room for the pages that may be touched by tree rebalancing.
+        self._maybe_checkpoint()
+
         lsn = self.wal.append_delete(key)
-        try:
-            self.tree.delete(key, lsn)
-        except DBBufferPoolOverflowError:
-            self.checkpoint()
-            self.tree.delete(key, lsn)
+        was_deleted = self.tree.delete(key, lsn)
+        assert was_deleted, "tree.delete returned False right after a positive pre-search"
 
         self._version_counter += 1
-        self._maybe_checkpoint_after_write()
+        self._maybe_checkpoint()
         return True
 
     def scan(

@@ -121,8 +121,10 @@ class FaultyFileFixture:
 
 @pytest.fixture
 def faulty_files(monkeypatch: pytest.MonkeyPatch) -> FaultyFileFixture:
-    """Patch the WAL's `open` and the global `os.fsync` so every WAL file is a
-    `FaultyFile` and every fsync snapshots the file's durable state.
+    """Patch the WAL's and pager's `open`, plus the global `os.fsync`, so every DB file is
+    a `FaultyFile` and every fsync snapshots the file's durable state.
+
+    Wrapping the pager too (not just the WAL) lets crash tests model lost data-file writes.
 
     Returns the fixture object, whose `crash_all()` method simulates a power
     failure by rolling every tracked file back to its last fsynced contents.
@@ -150,14 +152,14 @@ def faulty_files(monkeypatch: pytest.MonkeyPatch) -> FaultyFileFixture:
         else:
             real_fsync(fd)
 
-    # `bptreedb.wal.open` resolves to `builtins.open` because the wal module
-    # never rebinds it. Setting an attribute on the module makes the lookup
-    # find our shim first; `raising=False` allows the attribute to be created.
+    # `bptreedb.wal.open` and `bptreedb.pager.open` resolve to `builtins.open` because
+    # neither module rebinds it. Setting an attribute on the module makes the lookup find
+    # our shim first; `raising=False` allows the attribute to be created.
     monkeypatch.setattr("bptreedb.wal.open", faulty_open, raising=False)
+    monkeypatch.setattr("bptreedb.pager.open", faulty_open, raising=False)
 
-    # Patch `os.fsync` globally for the duration of the test. The WAL is the
-    # only thing that calls `os.fsync` in the codebase, so this is effectively
-    # surgical even though the patch is module-wide.
+    # Patch `os.fsync` globally for the duration of the test. Both the WAL and the pager
+    # route their fsyncs through `fs.fsync_file`, which calls `os.fsync` directly.
     monkeypatch.setattr(os, "fsync", patched_fsync)
 
     return fixture

@@ -171,5 +171,6 @@ def _install_fault_injection(monkeypatch: pytest.MonkeyPatch) -> FaultyFileFixtu
             real_fsync(fd)
 
     monkeypatch.setattr("bptreedb.wal.open", faulty_open, raising=False)
+    monkeypatch.setattr("bptreedb.pager.open", faulty_open, raising=False)
     monkeypatch.setattr(os, "fsync", patched_fsync)
     return fixture

@@ -105,8 +105,10 @@ class Pager:
             right_sibling_page_id=0,
             slots=[],
         )
-        self.flush_meta()
+        # Write the leaf before the meta so a crash here leaves an uncommitted meta rather
+        # than one that points at a zero-filled page.
         self.write_page(leaf_page_id, encode_page(initial_leaf_page, self.page_size_bytes))
+        self.flush_meta()
         self.fsync()
         fsync_directory(self.path.parent)
 

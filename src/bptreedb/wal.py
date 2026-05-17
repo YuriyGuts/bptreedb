@@ -189,6 +189,20 @@ class WAL:
         self.stats.fsyncs += 1
         return record.lsn
 
+    def peek_records(self) -> Iterator[WALRecord]:
+        """
+        Yield every record from the start of the WAL without truncating the torn tail.
+
+        Use this for read-only inspection passes; call `replay` when you also want the tail
+        truncated and the callback applied.
+
+        Raises
+        ------
+        DBCorruptedError
+            If a corrupt record is followed by a valid one, or if LSNs are non-sequential.
+        """
+        yield from self._iter_records()
+
     def _iter_records(self) -> Iterator[WALRecord]:
         """
         Yield records from the start of the WAL, tolerating a corrupt record at the tail.

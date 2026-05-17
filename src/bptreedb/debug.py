@@ -105,6 +105,22 @@ def raise_invariant_error(msg: str, node: BPlusTreeNode, level: int) -> None:
     raise AssertionError(formatted_msg)
 
 
+def _smallest_leaf_key(node: BPlusTreeNode) -> bytes:
+    """Return the smallest leaf key reachable from `node`."""
+    while isinstance(node.page, InternalPage):
+        node = node.children[0]
+    assert isinstance(node.page, LeafPage)
+    return node.page.slots[0].key
+
+
+def _largest_leaf_key(node: BPlusTreeNode) -> bytes:
+    """Return the largest leaf key reachable from `node`."""
+    while isinstance(node.page, InternalPage):
+        node = node.children[-1]
+    assert isinstance(node.page, LeafPage)
+    return node.page.slots[-1].key
+
+
 def assert_tree_invariants(tree: BPlusTree) -> None:  # noqa: PLR0912
     """
     Verify all structural invariants of a B+ tree.
@@ -156,13 +172,9 @@ def assert_tree_invariants(tree: BPlusTree) -> None:  # noqa: PLR0912
             if level_idx < level_count - 1:
                 assert isinstance(page, InternalPage)
                 for slot_idx, slot in enumerate(page.slots):
-                    is_correct_separator = node.children[slot_idx].page.slots[
-                        -1
-                    ].key < slot.key and (
-                        slot_idx == len(page.slots) - 1
-                        or slot.key <= node.children[slot_idx + 1].page.slots[0].key
-                    )
-                    if not is_correct_separator:
+                    left_child_max = _largest_leaf_key(node.children[slot_idx])
+                    right_child_min = _smallest_leaf_key(node.children[slot_idx + 1])
+                    if not (left_child_max < slot.key <= right_child_min):
                         raise_invariant_error("Invalid internal node separator", node, level_idx)
 
     # Leaf sibling pointers form a complete forward chain in key order with no cycles.

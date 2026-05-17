@@ -688,4 +688,4 @@ def get_max_freed_ids_per_freelist_page(page_size_bytes: int) -> int:
     -------
     The capacity of one freelist page, measured in freed-page-ID entries.
     """
-    return (page_size_bytes - 32) // 8
+    return (page_size_bytes - _PAGE_HEADER.size) // _PAGE_ID_FIELD.size
