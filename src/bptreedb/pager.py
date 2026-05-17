@@ -28,6 +28,8 @@ class PagerStats:
     page_reads: int = 0
     page_writes: int = 0
     pages_allocated: int = 0
+    pages_freed: int = 0
+    pages_reused_from_freelist: int = 0
     meta_flushes: int = 0
     fsyncs: int = 0
 
@@ -35,6 +37,8 @@ class PagerStats:
         self.page_reads = 0
         self.page_writes = 0
         self.pages_allocated = 0
+        self.pages_freed = 0
+        self.pages_reused_from_freelist = 0
         self.meta_flushes = 0
         self.fsyncs = 0
 
@@ -179,12 +183,14 @@ class Pager:
                     self._meta_page.freelist_head_page_id,
                     encode_page(freelist_page, self.page_size_bytes),
                 )
+                self.stats.pages_reused_from_freelist += 1
                 return page_id
 
             # Freelist head page is exhausted: recycle it for allocation and update the freelist
             # pointer to a successor page if available.
             page_id = self._meta_page.freelist_head_page_id
             self.update_meta(freelist_head_page_id=freelist_page.next_freelist_page_id)
+            self.stats.pages_reused_from_freelist += 1
             return page_id
 
         # Freelist is unavailable or exhausted: bump-allocate a new page.
@@ -192,6 +198,7 @@ class Pager:
 
     def free_page(self, page_id: int) -> None:
         assert self._meta_page is not None
+        self.stats.pages_freed += 1
 
         # If we already have a freelist head page which has room for one more entry, use it.
         if self._meta_page.freelist_head_page_id != 0:

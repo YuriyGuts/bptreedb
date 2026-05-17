@@ -475,6 +475,8 @@ def render_text(result: WorkloadResult) -> str:
         f"  page reads:          {result.pager_stats.page_reads:>14,}",
         f"  page writes:         {result.pager_stats.page_writes:>14,}",
         f"  pages allocated:     {result.pager_stats.pages_allocated:>14,}",
+        f"  pages freed:         {result.pager_stats.pages_freed:>14,}",
+        f"  pages reused:        {result.pager_stats.pages_reused_from_freelist:>14,}",
         f"  meta flushes:        {result.pager_stats.meta_flushes:>14,}",
         f"  fsyncs:              {result.pager_stats.fsyncs:>14,}",
         "",
@@ -499,6 +501,7 @@ def render_text(result: WorkloadResult) -> str:
         f"  records appended:    {result.wal_stats.records_appended:>14,}",
         f"  bytes appended:      {_format_bytes(result.wal_stats.bytes_appended):>14}",
         f"  fsyncs:              {result.wal_stats.fsyncs:>14,}",
+        f"  truncations:         {result.wal_stats.truncations:>14,}",
     ]
     return "\n".join(lines)
 

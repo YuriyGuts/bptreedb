@@ -24,12 +24,14 @@ class WALStats:
     bytes_appended: int = 0
     fsyncs: int = 0
     records_replayed: int = 0
+    truncations: int = 0
 
     def reset(self) -> None:
         self.records_appended = 0
         self.bytes_appended = 0
         self.fsyncs = 0
         self.records_replayed = 0
+        self.truncations = 0
 
 
 class WAL:
@@ -168,3 +170,4 @@ class WAL:
 
         self._fd.close()
         self._fd = open(self.path, "a+b")  # noqa: SIM115
+        self.stats.truncations += 1
