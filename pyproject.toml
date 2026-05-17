@@ -6,10 +6,14 @@ readme = "README.md"
 authors = [
     { name = "Yuriy Guts", email = "yuriy.guts@gmail.com" }
 ]
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "sortedcontainers>=2.4.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/YuriyGuts/bptreedb"
 
 [build-system]
 requires = ["uv_build>=0.10.6,<0.11.0"]
