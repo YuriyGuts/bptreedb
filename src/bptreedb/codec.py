@@ -1,3 +1,5 @@
+"""Wire-format encoders and decoders for pages and WAL records."""
+
 from __future__ import annotations
 
 import zlib
@@ -36,7 +38,17 @@ MIN_PAGE_SIZE = _META_PAGE_NO_CRC.size + _CRC32_FIELD.size
 
 
 class BufferReader:
+    """Cursor-based reader for sequentially decoding fields out of a byte buffer."""
+
     def __init__(self, data: bytes) -> None:
+        """
+        Wrap an existing byte buffer and start reading from offset zero.
+
+        Parameters
+        ----------
+        data
+            The bytes to read from.
+        """
         self.data = data
         self.offset = 0
 
@@ -47,23 +59,62 @@ class BufferReader:
         return Struct(spec)
 
     def read_struct(self, spec: str | Struct) -> tuple:
+        """
+        Unpack a `struct` spec from the current offset and advance past it.
+
+        Parameters
+        ----------
+        spec
+            A `struct.Struct` instance or a format string.
+
+        Returns
+        -------
+        The tuple of values produced by `struct.unpack_from`.
+        """
         st = self._as_struct(spec)
         value = st.unpack_from(self.data, self.offset)
         self.offset += st.size
         return value
 
     def read_bytes(self, length: int) -> bytes:
+        """
+        Read a fixed number of raw bytes from the current offset and advance past them.
+
+        Parameters
+        ----------
+        length
+            Number of bytes to read.
+
+        Returns
+        -------
+        The bytes that were read.
+        """
         value = self.data[self.offset : self.offset + length]
         self.offset += length
         return value
 
     def read_length_prefixed_bytes(self, length_spec: str | Struct = _LENGTH_FIELD) -> bytes:
+        """
+        Read a length prefix followed by that many bytes of payload.
+
+        Parameters
+        ----------
+        length_spec
+            Struct describing the length prefix; defaults to the standard 32-bit length field.
+
+        Returns
+        -------
+        The payload bytes (the length prefix itself is not included).
+        """
         length = self.read_struct(length_spec)[0]
         return self.read_bytes(length)
 
 
 class BufferWriter:
+    """Append-only builder for encoding fields into a byte buffer."""
+
     def __init__(self) -> None:
+        """Start with an empty buffer."""
         self._buffer = bytearray()
 
     @staticmethod
@@ -73,6 +124,16 @@ class BufferWriter:
         return Struct(spec)
 
     def write_struct(self, spec: str | Struct, *values: Any) -> None:  # noqa: ANN401
+        """
+        Pack a `struct` spec with the given values and append it to the buffer.
+
+        Parameters
+        ----------
+        spec
+            A `struct.Struct` instance or a format string.
+        values
+            Values to pack, in the order expected by `spec`.
+        """
         st = self._as_struct(spec)
         offset = len(self._buffer)
         self._buffer.extend(bytes(st.size))
@@ -82,6 +143,14 @@ class BufferWriter:
         self,
         value: bytes | bytearray | memoryview | BufferWriter,
     ) -> None:
+        """
+        Append a raw byte sequence (or the contents of another `BufferWriter`) to the buffer.
+
+        Parameters
+        ----------
+        value
+            The bytes to append. A nested `BufferWriter` is unwrapped and its bytes are copied in.
+        """
         if isinstance(value, BufferWriter):
             self._buffer += value._buffer
         else:
@@ -92,42 +161,93 @@ class BufferWriter:
         value: bytes | bytearray | memoryview | BufferWriter,
         length_spec: str | Struct = _LENGTH_FIELD,
     ) -> None:
+        """
+        Write a length prefix followed by the given payload.
+
+        Parameters
+        ----------
+        value
+            The payload to write.
+        length_spec
+            Struct describing the length prefix; defaults to the standard 32-bit length field.
+        """
         length = len(value._buffer) if isinstance(value, BufferWriter) else len(value)
         self.write_struct(length_spec, length)
         self.write_bytes(value)
 
     def write_crc32(self) -> None:
+        """Append a CRC32 covering everything previously written into the buffer."""
         self.write_struct(_CRC32_FIELD, self.crc32())
 
     def tell(self) -> int:
+        """
+        Return the current buffer position.
+
+        Returns
+        -------
+        The number of bytes currently in the buffer.
+        """
         return len(self._buffer)
 
     def build(self) -> bytes:
+        """
+        Materialize the buffer.
+
+        Returns
+        -------
+        The buffer's accumulated contents as an immutable `bytes` object.
+        """
         return bytes(self._buffer)
 
     def crc32(self) -> int:
+        """
+        Compute the CRC32 of the buffer's current contents.
+
+        Returns
+        -------
+        The CRC32 value.
+        """
         return zlib.crc32(self._buffer)
 
     def __bytes__(self) -> bytes:
+        """Allow `bytes(writer)` to materialize the buffer."""
         return self.build()
 
     def __len__(self) -> int:
+        """Return the number of bytes currently in the buffer."""
         return len(self._buffer)
 
 
 class WALOperationType(IntEnum):
+    """Tag byte identifying the kind of operation recorded in a WAL entry."""
+
     PUT = 0x01
     DELETE = 0x02
     CHECKPOINT = 0x03
 
 
 class PageType(IntEnum):
+    """Tag byte identifying the kind of page stored at a given page slot."""
+
     INTERNAL = 0x01
     LEAF = 0x02
     FREELIST = 0x03
 
 
 def verify_crc32(data: bytes) -> None:
+    """
+    Verify that the trailing CRC32 field of `data` matches the CRC of the preceding bytes.
+
+    Parameters
+    ----------
+    data
+        A byte buffer whose last four bytes are the expected CRC32.
+
+    Raises
+    ------
+    DBChecksumError
+        If the CRC computed from the payload does not match the trailing field.
+    """
     actual_crc32 = zlib.crc32(data[: -_CRC32_FIELD.size])
     expected_crc32 = _CRC32_FIELD.unpack(data[-_CRC32_FIELD.size :])[0]
     if actual_crc32 != expected_crc32:
@@ -135,6 +255,18 @@ def verify_crc32(data: bytes) -> None:
 
 
 def encode_wal_record(record: WALRecord) -> bytes:
+    """
+    Encode a WAL record into its on-disk wire format (length prefix + body + CRC).
+
+    Parameters
+    ----------
+    record
+        The record to encode.
+
+    Returns
+    -------
+    The encoded bytes.
+    """
     header_writer = BufferWriter()
     payload_writer = BufferWriter()
 
@@ -167,6 +299,23 @@ def encode_wal_record(record: WALRecord) -> bytes:
 
 
 def decode_wal_record(data: bytes) -> WALRecord:
+    """
+    Decode a single WAL record from the given byte buffer.
+
+    Parameters
+    ----------
+    data
+        The bytes that make up the full record (including length prefix and CRC).
+
+    Returns
+    -------
+    The decoded WAL record.
+
+    Raises
+    ------
+    DBChecksumError
+        If the CRC at the end of `data` does not match the payload.
+    """
     verify_crc32(data)
     reader = BufferReader(data)
     reader.read_bytes(_LENGTH_FIELD.size)
@@ -195,6 +344,23 @@ def decode_wal_record(data: bytes) -> WALRecord:
 
 
 def decode_next_wal_record_from_file(file: IO[bytes]) -> WALRecord:
+    """
+    Read and decode the next WAL record from an open file at its current position.
+
+    Parameters
+    ----------
+    file
+        A binary file object positioned at the start of a WAL record.
+
+    Returns
+    -------
+    The decoded WAL record.
+
+    Raises
+    ------
+    EOFError
+        If the file ends before a full record can be read.
+    """
     length_bytes = file.read(_LENGTH_FIELD.size)
     if len(length_bytes) != _LENGTH_FIELD.size:
         raise EOFError()
@@ -211,6 +377,18 @@ def decode_next_wal_record_from_file(file: IO[bytes]) -> WALRecord:
 
 
 def encode_meta_page(page: MetaPage) -> bytes:
+    """
+    Encode the meta page to its on-disk form, padded out to the configured page size.
+
+    Parameters
+    ----------
+    page
+        The meta page to encode.
+
+    Returns
+    -------
+    The full-sized page buffer ready to be written to disk.
+    """
     writer = BufferWriter()
     writer.write_struct(
         _META_PAGE_NO_CRC,
@@ -228,6 +406,25 @@ def encode_meta_page(page: MetaPage) -> bytes:
 
 
 def decode_meta_page(data: bytes) -> MetaPage:
+    """
+    Decode the meta page from its on-disk form.
+
+    Parameters
+    ----------
+    data
+        The raw page buffer read from disk.
+
+    Returns
+    -------
+    The decoded meta page.
+
+    Raises
+    ------
+    DBCorruptedError
+        If the magic prefix is missing.
+    DBChecksumError
+        If the CRC32 field does not match the encoded payload.
+    """
     data = data[: _META_PAGE_NO_CRC.size + _CRC32_FIELD.size]
 
     if data[: len(DATA_FILE_MAGIC_PREFIX)] != DATA_FILE_MAGIC_PREFIX:
@@ -246,6 +443,24 @@ def decode_meta_page(data: bytes) -> MetaPage:
 
 
 def encode_page(page: InternalPage | LeafPage | FreelistPage, page_size_bytes: int) -> bytes:
+    """
+    Encode a page into its fixed-size on-disk representation.
+
+    Internal and leaf pages use a slotted layout: the header and slot directory grow forward from
+    the start of the page, while individual records are packed backward from the end. Freelist
+    pages just store a flat array of freed page IDs.
+
+    Parameters
+    ----------
+    page
+        The page to encode.
+    page_size_bytes
+        Size of the output buffer, in bytes; any unused space is zero-padded.
+
+    Returns
+    -------
+    The full-sized page buffer ready to be written to disk.
+    """
     page_buffer = bytearray(page_size_bytes)
     record_end_ptr = len(page_buffer)
 
@@ -314,6 +529,18 @@ def encode_page(page: InternalPage | LeafPage | FreelistPage, page_size_bytes: i
 
 
 def decode_page(data: bytes) -> InternalPage | LeafPage | FreelistPage:
+    """
+    Decode a page from its on-disk byte representation, dispatching on the page type tag.
+
+    Parameters
+    ----------
+    data
+        The raw page buffer read from disk.
+
+    Returns
+    -------
+    The decoded page, with a concrete type chosen by the tag byte in the header.
+    """
     reader = BufferReader(data)
     (
         page_type,
@@ -368,6 +595,21 @@ def decode_page(data: bytes) -> InternalPage | LeafPage | FreelistPage:
 
 
 def calculate_slot_size(slot: LeafSlot | InternalSlot, include_meta: bool = False) -> int:
+    """
+    Compute the number of encoded bytes a slot occupies on the page.
+
+    Parameters
+    ----------
+    slot
+        The slot whose encoded size is being computed.
+    include_meta
+        When true, the slot directory entry pointing at the slot is included as well.
+        This is what callers normally want when sizing the page as a whole.
+
+    Returns
+    -------
+    The encoded byte size of the slot.
+    """
     base_size = _SLOT_ENTRY.size if include_meta else 0
     match slot:
         case InternalSlot():
@@ -379,6 +621,18 @@ def calculate_slot_size(slot: LeafSlot | InternalSlot, include_meta: bool = Fals
 
 
 def calculate_page_size(page: InternalPage | LeafPage) -> int:
+    """
+    Compute the encoded byte size of a page.
+
+    Parameters
+    ----------
+    page
+        The page whose encoded size is being computed.
+
+    Returns
+    -------
+    The total size in bytes: page header + slot directory + records.
+    """
     encoded_page_size = _PAGE_HEADER.size
     for slot in page.slots:
         encoded_page_size += calculate_slot_size(slot, include_meta=True)
@@ -386,14 +640,52 @@ def calculate_page_size(page: InternalPage | LeafPage) -> int:
 
 
 def calculate_leaf_record_size(key: bytes, value: bytes) -> int:
+    """
+    Compute the encoded byte size of a leaf record.
+
+    Parameters
+    ----------
+    key
+        The leaf key.
+    value
+        The associated value.
+
+    Returns
+    -------
+    Two length prefixes plus `len(key) + len(value)`.
+    """
     return _LENGTH_FIELD.size * 2 + len(key) + len(value)
 
 
 def get_max_leaf_record_size(page_size_bytes: int) -> int:
+    """
+    Compute the largest leaf record that can safely fit on a page of the given size.
+
+    Parameters
+    ----------
+    page_size_bytes
+        Size of a page in bytes.
+
+    Returns
+    -------
+    The maximum record size, in bytes.
+    """
     # The 20% cap (not 25%) ensures that no single slot is large enough to force a split into
     # underpopulated half-pages which are impossible to balance without introducing new techniques.
     return (page_size_bytes - _PAGE_HEADER.size) // 5 - _SLOT_ENTRY.size
 
 
 def get_max_freed_ids_per_freelist_page(page_size_bytes: int) -> int:
+    """
+    Compute the maximum number of freed page IDs that fit on a single freelist page.
+
+    Parameters
+    ----------
+    page_size_bytes
+        Size of a page in bytes.
+
+    Returns
+    -------
+    The capacity of one freelist page, measured in freed-page-ID entries.
+    """
     return (page_size_bytes - 32) // 8

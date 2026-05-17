@@ -1,3 +1,5 @@
+"""Public database facade that ties the pager, buffer pool, B+ tree, and WAL together."""
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -24,6 +26,8 @@ DEFAULT_PAGE_SIZE = 4096
 
 
 class DB:
+    """A single-process embedded key/value database."""
+
     def __init__(
         self,
         data_dir: str | Path,
@@ -64,6 +68,7 @@ class DB:
         self._recovery_last_checkpoint_lsn = 0
 
     def open(self) -> None:
+        """Open the data directory, recover from the WAL, and bring the database online."""
         dir_already_existed = self.data_dir.exists()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         if not dir_already_existed:
@@ -85,6 +90,7 @@ class DB:
         self.is_opened = True
 
     def close(self) -> None:
+        """Take a final checkpoint and release all underlying file handles."""
         if not self.is_opened:
             return
 
@@ -97,6 +103,7 @@ class DB:
             self._version_counter = 0
 
     def __enter__(self) -> Self:
+        """Enter the context manager that automatically opens and closes the database."""
         self.open()
         return self
 
@@ -106,15 +113,25 @@ class DB:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> bool:
+        """Exit the context manager that automatically opens and closes the database."""
         self.close()
         # Do not suppress exceptions.
         return False
 
     def _check_if_opened(self) -> None:
+        """Raise `DBClosedError` if the database has not been opened."""
         if not self.is_opened:
             raise DBClosedError()
 
     def _apply_wal_record(self, record: WALRecord) -> None:
+        """
+        Re-apply a single WAL record during recovery, skipping anything pre-checkpoint.
+
+        Parameters
+        ----------
+        record
+            The WAL record being replayed.
+        """
         if record.lsn <= self._recovery_last_checkpoint_lsn:
             return
 
@@ -127,10 +144,21 @@ class DB:
                 pass
 
     def _ensure_bytes_type(self, value: bytes, param_name: str) -> None:
+        """
+        Reject any argument that is not a `bytes` instance.
+
+        Parameters
+        ----------
+        value
+            The value to type-check.
+        param_name
+            Name of the parameter being checked; used to build the error message.
+        """
         if not isinstance(value, bytes):
             raise TypeError(f"{param_name} must have the bytes type")
 
     def _maybe_checkpoint_after_write(self) -> None:
+        """Trigger a checkpoint if the WAL or the dirty page ratio crossed the configured limit."""
         should_checkpoint = (
             self.wal.size_bytes > self.checkpoint_wal_size_bytes
             or self.buffer_pool.dirty_ratio > self.checkpoint_dirty_page_ratio
@@ -139,6 +167,16 @@ class DB:
             self.checkpoint()
 
     def put(self, key: bytes, value: bytes) -> None:
+        """
+        Insert or overwrite the value associated with `key`.
+
+        Parameters
+        ----------
+        key
+            The key to insert or update.
+        value
+            The value to associate with the key.
+        """
         self._check_if_opened()
         self._ensure_bytes_type(key, "key")
         self._ensure_bytes_type(value, "value")
@@ -154,11 +192,35 @@ class DB:
         self._maybe_checkpoint_after_write()
 
     def get(self, key: bytes) -> bytes | None:
+        """
+        Look up the value associated with `key`.
+
+        Parameters
+        ----------
+        key
+            The key to look up.
+
+        Returns
+        -------
+        The stored value, or `None` if no such key exists.
+        """
         self._check_if_opened()
         self._ensure_bytes_type(key, "key")
         return self.tree.search(key)
 
     def delete(self, key: bytes) -> bool:
+        """
+        Delete `key` from the database.
+
+        Parameters
+        ----------
+        key
+            The key to remove.
+
+        Returns
+        -------
+        `True` if the key existed and was removed, `False` if it was not present.
+        """
         self._check_if_opened()
         self._ensure_bytes_type(key, "key")
         if self.tree.search(key) is None:
@@ -180,6 +242,25 @@ class DB:
         start_key_inclusive: bytes | None,
         end_key_exclusive: bytes | None,
     ) -> Iterator[tuple[bytes, bytes]]:
+        """
+        Iterate over key/value pairs within the half-open range `[start, end)`.
+
+        Parameters
+        ----------
+        start_key_inclusive
+            Lower bound on the key; pass `None` to start from the very first key.
+        end_key_exclusive
+            Upper bound on the key (exclusive); pass `None` to scan to the end.
+
+        Returns
+        -------
+        An iterator over `(key, value)` tuples in key order.
+
+        Raises
+        ------
+        DBConcurrentPageModificationError
+            If the database is mutated by another `put`/`delete` during iteration.
+        """
         # Validate eagerly so callers see exceptions at the call site, not on the first `next()`.
         # A bare `yield` in this function body would turn it into a generator and defer every check.
         self._check_if_opened()
@@ -199,6 +280,12 @@ class DB:
         return self.tree.scan(start_key_inclusive, end_key_exclusive, check_version)
 
     def checkpoint(self) -> None:
+        """
+        Flush dirty pages, record a checkpoint in the WAL, then truncate the WAL.
+
+        After a successful checkpoint, recovery is bounded: the next `open()` only needs to
+        replay records past `last_checkpoint_lsn`.
+        """
         checkpoint_lsn = self.wal.current_lsn + 1
         self.buffer_pool.flush_all()
         self.pager.fsync()

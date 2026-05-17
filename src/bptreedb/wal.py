@@ -1,3 +1,5 @@
+"""Append-only write-ahead log: durability for writes and the source of truth for recovery."""
+
 from collections.abc import Callable
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -20,6 +22,8 @@ from bptreedb.fs import fsync_file
 
 @dataclass
 class WALStats:
+    """A statistics object that tracks WAL activity."""
+
     records_appended: int = 0
     bytes_appended: int = 0
     fsyncs: int = 0
@@ -27,6 +31,7 @@ class WALStats:
     truncations: int = 0
 
     def reset(self) -> None:
+        """Reset all stats to initial values."""
         self.records_appended = 0
         self.bytes_appended = 0
         self.fsyncs = 0
@@ -35,7 +40,17 @@ class WALStats:
 
 
 class WAL:
+    """Append-only log of mutations, fsynced on every append for crash safety."""
+
     def __init__(self, path: Path) -> None:
+        """
+        Create a new WAL instance backed by the file at `path`.
+
+        Parameters
+        ----------
+        path
+            The path to the WAL file. The file does not need to exist yet.
+        """
         self.path = path
         self.checkpoint_temp_path = path.with_name(path.name + ".new")
         self.current_lsn = 0
@@ -43,6 +58,7 @@ class WAL:
         self._fd: IO[bytes] | None = None
 
     def open(self) -> None:
+        """Open the WAL file in append mode, cleaning up any leftover rotation temp file."""
         if self._fd is not None:
             return
 
@@ -56,6 +72,7 @@ class WAL:
             fsync_directory(self.path.parent)
 
     def close(self) -> None:
+        """Fsync any buffered writes and close the file handle."""
         if self._fd is not None:
             fsync_file(self._fd)
             self.stats.fsyncs += 1
@@ -63,6 +80,7 @@ class WAL:
             self._fd = None
 
     def __enter__(self) -> Self:
+        """Enter the context manager that automatically opens and closes the WAL."""
         self.open()
         return self
 
@@ -72,15 +90,31 @@ class WAL:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> bool:
+        """Exit the context manager that automatically opens and closes the WAL."""
         self.close()
         # Do not suppress exceptions.
         return False
 
     @property
     def size_bytes(self) -> int:
+        """Current size of the WAL file on disk, in bytes."""
         return self.path.stat().st_size
 
     def append_put(self, key: bytes, value: bytes) -> int:
+        """
+        Append a PUT record.
+
+        Parameters
+        ----------
+        key
+            The key being written.
+        value
+            The associated value.
+
+        Returns
+        -------
+        The LSN assigned to the new record.
+        """
         record = WALPutRecord(
             lsn=self.current_lsn + 1,
             key=key,
@@ -89,6 +123,18 @@ class WAL:
         return self._append(record)
 
     def append_delete(self, key: bytes) -> int:
+        """
+        Append a DELETE record.
+
+        Parameters
+        ----------
+        key
+            The key being deleted.
+
+        Returns
+        -------
+        The LSN assigned to the new record.
+        """
         record = WALDeleteRecord(
             lsn=self.current_lsn + 1,
             key=key,
@@ -96,6 +142,22 @@ class WAL:
         return self._append(record)
 
     def append_checkpoint(self, root_page_id: int, freelist_head: int, next_page_id: int) -> int:
+        """
+        Append a CHECKPOINT record snapshotting the given meta fields.
+
+        Parameters
+        ----------
+        root_page_id
+            ID of the root page at the time of the checkpoint.
+        freelist_head
+            ID of the freelist head page (or zero if there is none).
+        next_page_id
+            Next page ID the pager would hand out via bump allocation.
+
+        Returns
+        -------
+        The LSN assigned to the new record.
+        """
         record = WALCheckpointRecord(
             lsn=self.current_lsn + 1,
             root_page_id=root_page_id,
@@ -105,6 +167,18 @@ class WAL:
         return self._append(record)
 
     def _append(self, record: WALRecord) -> int:
+        """
+        Encode a record, write it, fsync, and update internal state.
+
+        Parameters
+        ----------
+        record
+            The fully populated record to append. Its `lsn` becomes the new `current_lsn`.
+
+        Returns
+        -------
+        The LSN of the appended record.
+        """
         assert self._fd is not None
         encoded = encode_wal_record(record)
         self.current_lsn = record.lsn
@@ -116,6 +190,14 @@ class WAL:
         return record.lsn
 
     def _iter_records(self) -> Iterator[WALRecord]:
+        """
+        Yield records from the start of the WAL, tolerating a corrupt record at the tail.
+
+        Raises
+        ------
+        DBCorruptedError
+            If a corrupt record is followed by a valid one, or if LSNs are non-sequential.
+        """
         assert self._fd is not None
         self._fd.seek(0)
         last_lsn = 0
@@ -139,6 +221,16 @@ class WAL:
                 break
 
     def replay(self, callback: Callable[[WALRecord], None]) -> None:
+        """
+        Replay every record through `callback`, then truncate any partial trailing record.
+
+        Truncation runs unconditionally so the next `_append` writes to a clean tail.
+
+        Parameters
+        ----------
+        callback
+            Function invoked once per record, in LSN order.
+        """
         assert self._fd is not None
         self.current_lsn = 0
         last_good_file_pos = 0
@@ -156,6 +248,17 @@ class WAL:
         self.stats.fsyncs += 1
 
     def truncate_before(self, lsn: int) -> None:
+        """
+        Atomically rewrite the WAL, dropping every record with LSN strictly less than `lsn`.
+
+        The rewrite goes through a temp file that is then `rename()`d over the original, so a
+        crash mid-rotation leaves either the old or the new WAL intact.
+
+        Parameters
+        ----------
+        lsn
+            Records with `record.lsn >= lsn` are kept; everything older is discarded.
+        """
         assert self._fd is not None
 
         # Generate a new WAL file, transfer newer records there, and replace the old WAL with it.

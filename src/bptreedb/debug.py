@@ -1,3 +1,5 @@
+"""Debug helpers for inspecting tree shape and verifying B+ tree invariants in tests."""
+
 from __future__ import annotations
 
 from collections import deque
@@ -10,17 +12,46 @@ from bptreedb.tree import BPlusTree
 
 @dataclass
 class BPlusTreeNode:
+    """A single materialized node in the in-memory tree representation."""
+
     page_id: int
     page: LeafPage | InternalPage
     children: list[BPlusTreeNode]
 
 
 def page_id_to_node(tree: BPlusTree, page_id: int) -> BPlusTreeNode:
+    """
+    Materialize a `BPlusTreeNode` by fetching the page with the given ID through the cache.
+
+    Parameters
+    ----------
+    tree
+        The tree the page belongs to.
+    page_id
+        The ID of the page to wrap.
+
+    Returns
+    -------
+    A node with an empty `children` list; the caller is responsible for populating it.
+    """
     page = tree.buffer_pool.get(page_id)
     return BPlusTreeNode(page_id=page_id, page=page, children=[])
 
 
 def bfs_walk_tree(tree: BPlusTree) -> list[list[BPlusTreeNode]]:
+    """
+    Walk the tree breadth-first.
+
+    Parameters
+    ----------
+    tree
+        The tree to traverse.
+
+    Returns
+    -------
+    A list of levels, with position 0 holding the root and the last position holding the leaves.
+    Each node has its `children` populated, so callers can navigate without re-fetching.
+    """
     result = []
     queue = deque()
     meta = tree.pager.get_meta()
@@ -51,6 +82,23 @@ def bfs_walk_tree(tree: BPlusTree) -> list[list[BPlusTreeNode]]:
 
 
 def raise_invariant_error(msg: str, node: BPlusTreeNode, level: int) -> None:
+    """
+    Format an invariant-violation message with node context and raise it.
+
+    Parameters
+    ----------
+    msg
+        Short description of the invariant that was violated.
+    node
+        The offending node.
+    level
+        The level in the tree at which the node sits.
+
+    Raises
+    ------
+    AssertionError
+        Always; this function never returns.
+    """
     formatted_msg = (
         f"{msg} (page ID: {node.page_id}, page type: {type(node.page).__name__}, level: {level})"
     )
@@ -58,6 +106,23 @@ def raise_invariant_error(msg: str, node: BPlusTreeNode, level: int) -> None:
 
 
 def assert_tree_invariants(tree: BPlusTree) -> None:  # noqa: PLR0912
+    """
+    Verify all structural invariants of a B+ tree.
+
+    Checks performed: bounded page IDs, per-page key ordering, leaf/internal level discipline,
+    fill thresholds for non-root pages, correctness of internal separators, and the integrity
+    of the leaf sibling chain.
+
+    Parameters
+    ----------
+    tree
+        The tree to inspect.
+
+    Raises
+    ------
+    AssertionError
+        On the first invariant violation found.
+    """
     meta = tree.pager.get_meta()
     bfs_walk = bfs_walk_tree(tree)
     level_count = len(bfs_walk)

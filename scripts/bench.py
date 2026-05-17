@@ -50,6 +50,8 @@ PROGRESS_LABEL_WIDTH = 25
 
 @dataclass
 class WorkloadParams:
+    """Knobs that describe a single workload run; can be overridden from the CLI."""
+
     n_ops: int = 100_000
     key_size: int = 16
     value_size: int = 64
@@ -64,6 +66,8 @@ class WorkloadParams:
 
 @dataclass
 class TreeShape:
+    """A snapshot of structural properties of the tree at the end of a workload."""
+
     depth: int
     leaf_pages: int
     internal_pages: int
@@ -72,6 +76,8 @@ class TreeShape:
 
 @dataclass
 class WorkloadResult:
+    """Everything we collect from a single workload run: timing, counters, and disk footprint."""
+
     preset_name: str
     params: WorkloadParams
     page_size_bytes: int
@@ -114,7 +120,21 @@ def _make_value(rng: random.Random, size: int) -> bytes:
 
 
 class ProgressReporter:
+    """Prints a single rewriting progress line to stderr, rate-limited to one update per second."""
+
     def __init__(self, label: str, total: int, *, enabled: bool) -> None:
+        """
+        Create a reporter tracking progress toward `total` operations.
+
+        Parameters
+        ----------
+        label
+            Short tag shown in the progress line (e.g. "random-put:measure").
+        total
+            Total number of operations expected.
+        enabled
+            When false, all `tick`/`finish` calls become no-ops.
+        """
         self._label = label
         self._total = total
         self._enabled = enabled
@@ -122,6 +142,14 @@ class ProgressReporter:
         self._start = self._last_tick
 
     def tick(self, done: int) -> None:
+        """
+        Maybe redraw the progress line; cheap to call on every operation.
+
+        Parameters
+        ----------
+        done
+            Total operations completed so far.
+        """
         if not self._enabled or self._total <= 0:
             return
         now = time.perf_counter()
@@ -139,16 +167,33 @@ class ProgressReporter:
         )
 
     def finish(self) -> None:
+        """Emit a trailing newline so the next stderr line starts on a fresh row."""
         if self._enabled and self._total > 0:
             print("", file=sys.stderr)
 
 
 @dataclass
 class RunContext:
+    """Per-workload context used to spawn appropriately labeled progress reporters."""
+
     preset_name: str
     show_progress: bool
 
     def progress_for(self, phase: str, total: int) -> ProgressReporter:
+        """
+        Build a `ProgressReporter` labeled with `<preset>:<phase>`.
+
+        Parameters
+        ----------
+        phase
+            Short name of the phase being timed (e.g. "preload", "measure").
+        total
+            Total operations expected during the phase.
+
+        Returns
+        -------
+        A new reporter wired up to this context's progress settings.
+        """
         return ProgressReporter(f"{self.preset_name}:{phase}", total, enabled=self.show_progress)
 
 
@@ -341,6 +386,26 @@ def measure(
     *,
     show_progress: bool,
 ) -> WorkloadResult:
+    """
+    Run a single workload against a freshly created database and collect the results.
+
+    Parameters
+    ----------
+    preset_name
+        Name of the workload preset; selects the runner function.
+    params
+        Parameters describing the workload's size and shape.
+    page_size_bytes
+        Page size to use for the fresh database.
+    data_dir
+        Directory the database lives in. The directory is wiped before the run.
+    show_progress
+        Whether to emit progress ticks to stderr.
+
+    Returns
+    -------
+    A populated `WorkloadResult` for the run.
+    """
     if data_dir.exists():
         shutil.rmtree(data_dir)
 
@@ -424,6 +489,18 @@ def _cache_hit_ratio(result: WorkloadResult) -> str:
 
 
 def render_text(result: WorkloadResult) -> str:
+    """
+    Format a workload result as a human-readable, multi-line text report.
+
+    Parameters
+    ----------
+    result
+        The workload result to render.
+
+    Returns
+    -------
+    The report as a single string with embedded newlines.
+    """
     sorted_lat = sorted(result.latencies_ns)
     p50 = _percentile(sorted_lat, 0.50) / 1000
     p95 = _percentile(sorted_lat, 0.95) / 1000
@@ -507,6 +584,18 @@ def render_text(result: WorkloadResult) -> str:
 
 
 def render_json(result: WorkloadResult) -> dict:
+    """
+    Format a workload result as a JSON-serializable dict for machine-readable output.
+
+    Parameters
+    ----------
+    result
+        The workload result to render.
+
+    Returns
+    -------
+    A nested dictionary ready to be passed to `json.dumps`.
+    """
     sorted_lat = sorted(result.latencies_ns)
     return {
         "preset": result.preset_name,
@@ -594,6 +683,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """
+    Parse CLI args, run the requested workloads, and emit results to stdout.
+
+    Parameters
+    ----------
+    argv
+        Command-line arguments to parse; when `None`, defaults to `sys.argv[1:]`.
+
+    Returns
+    -------
+    Process exit code.
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
 

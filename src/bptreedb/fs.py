@@ -1,3 +1,5 @@
+"""Filesystem helpers for durably persisting data to disk."""
+
 import os
 from typing import IO
 

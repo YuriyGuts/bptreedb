@@ -1,3 +1,5 @@
+"""B+ tree algorithms: search, insertion, deletion, range scans, and rebalancing."""
+
 import bisect
 from collections.abc import Callable
 from collections.abc import Iterator
@@ -22,12 +24,16 @@ _KEY_GETTER = attrgetter("key")
 
 @dataclass
 class PathItem:
+    """A single step in the path from the root to a leaf, recording how we descended."""
+
     parent_page_id: int
     parent_slot_index: int
 
 
 @dataclass
 class LeafSearchResult:
+    """Outcome of a root-to-leaf descent: the leaf page reached and the path taken to get there."""
+
     leaf_page_id: int
     leaf_page: LeafPage
     path: list[PathItem]
@@ -35,6 +41,8 @@ class LeafSearchResult:
 
 @dataclass
 class TreeStats:
+    """A statistics object that tracks structural changes to the tree."""
+
     leaf_splits: int = 0
     internal_splits: int = 0
     leaf_merges: int = 0
@@ -44,6 +52,7 @@ class TreeStats:
     root_collapses: int = 0
 
     def reset(self) -> None:
+        """Reset all stats to initial values."""
         self.leaf_splits = 0
         self.internal_splits = 0
         self.leaf_merges = 0
@@ -54,22 +63,48 @@ class TreeStats:
 
 
 class BPlusTree:
+    """A disk-backed B+ tree that delegates persistence to a pager and a buffer pool."""
+
     HALF_FULL_THRESHOLD = 0.4
 
     def __init__(self, pager: Pager, buffer_pool: BufferPool) -> None:
+        """
+        Create a tree backed by the given pager and buffer pool.
+
+        Parameters
+        ----------
+        pager
+            The pager that owns the underlying page file.
+        buffer_pool
+            The buffer pool used to read, mutate, and write pages.
+        """
         self.pager = pager
         self.buffer_pool = buffer_pool
         self.stats = TreeStats()
 
     @property
     def page_size_bytes(self) -> int:
+        """Page size of the underlying pager, in bytes."""
         return self.pager.get_meta().page_size_bytes
 
     @property
     def root_page_id(self) -> int:
+        """Current root page ID, looked up via the pager's meta page."""
         return self.pager.get_meta().root_page_id
 
     def search(self, key: bytes) -> bytes | None:
+        """
+        Look up the value associated with `key`.
+
+        Parameters
+        ----------
+        key
+            The key to look up.
+
+        Returns
+        -------
+        The stored value, or `None` if no such key exists.
+        """
         # Find the leaf node that may contain the key.
         leaf_page = self._find_leaf(key).leaf_page
 
@@ -80,6 +115,23 @@ class BPlusTree:
         return leaf_page.slots[slot_idx].value
 
     def insert(self, key: bytes, value: bytes, lsn: int) -> None:
+        """
+        Insert or overwrite the value for `key`.
+
+        Parameters
+        ----------
+        key
+            The key to insert or update.
+        value
+            The value to associate with the key.
+        lsn
+            LSN to stamp onto every page modified by this operation.
+
+        Raises
+        ------
+        DBRecordTooLargeError
+            If the encoded `(key, value)` pair would exceed the per-page record size limit.
+        """
         self._raise_if_record_too_large(key, value)
 
         # Find a leaf page to insert into.
@@ -101,6 +153,20 @@ class BPlusTree:
         self._balance_and_write_tree(leaf_page_id, leaf_page, leaf_result.path, lsn)
 
     def delete(self, key: bytes, lsn: int) -> bool:
+        """
+        Remove `key` from the tree.
+
+        Parameters
+        ----------
+        key
+            The key to remove.
+        lsn
+            LSN to stamp onto every page modified by this operation.
+
+        Returns
+        -------
+        `True` if the key existed and was removed, `False` if it was not present.
+        """
         # Find the leaf node that may contain the key.
         leaf_result = self._find_leaf(key)
         leaf_page_id = leaf_result.leaf_page_id
@@ -127,6 +193,25 @@ class BPlusTree:
         end_key_exclusive: bytes | None,
         version_checker: Callable[[], None] | None = None,
     ) -> Iterator[tuple[bytes, bytes]]:
+        """
+        Yield key/value pairs within the half-open range `[start, end)` in key order.
+
+        Walks the leaf sibling chain after the first descent.
+
+        Parameters
+        ----------
+        start_key_inclusive
+            Lower bound on the key; `None` is treated as the very first key.
+        end_key_exclusive
+            Upper bound on the key (exclusive); `None` means "scan to the end".
+        version_checker
+            Optional callback invoked before and after every yield. Use it to raise from the
+            caller side when a concurrent mutation is detected.
+
+        Returns
+        -------
+        An iterator over `(key, value)` tuples in key order.
+        """
         # Find the leaf node that may contain the start key.
         start_key_inclusive = start_key_inclusive or b""
         leaf_result = self._find_leaf(start_key_inclusive)
@@ -159,18 +244,69 @@ class BPlusTree:
                 return
 
     def _raise_if_record_too_large(self, key: bytes, value: bytes) -> None:
+        """
+        Bounds-check a key/value pair against the per-record size limit.
+
+        Parameters
+        ----------
+        key
+            The proposed key.
+        value
+            The proposed value.
+
+        Raises
+        ------
+        DBRecordTooLargeError
+            If the encoded `(key, value)` pair would not fit on a leaf page.
+        """
         max_leaf_record_size = get_max_leaf_record_size(self.page_size_bytes)
         current_leaf_record_size = calculate_leaf_record_size(key, value)
         if current_leaf_record_size > max_leaf_record_size:
             raise DBRecordTooLargeError(limit=max_leaf_record_size, actual=current_leaf_record_size)
 
     def _is_page_overpopulated(self, page: LeafPage | InternalPage) -> bool:
+        """
+        Check whether the page would overflow its on-disk byte budget if written as-is.
+
+        Parameters
+        ----------
+        page
+            The page being checked.
+
+        Returns
+        -------
+        `True` when the encoded size exceeds the page size, `False` otherwise.
+        """
         return calculate_page_size(page) > self.page_size_bytes
 
     def _is_page_underpopulated(self, page: LeafPage | InternalPage) -> bool:
+        """
+        Check whether the page sits below the half-full threshold.
+
+        Parameters
+        ----------
+        page
+            The page being checked.
+
+        Returns
+        -------
+        `True` when the encoded size is below the threshold, `False` otherwise.
+        """
         return calculate_page_size(page) < self.HALF_FULL_THRESHOLD * self.page_size_bytes
 
     def _find_leaf(self, key: bytes) -> LeafSearchResult:
+        """
+        Descend from the root to the leaf page that may contain `key`.
+
+        Parameters
+        ----------
+        key
+            The key driving the descent.
+
+        Returns
+        -------
+        The reached leaf page, its ID, and the path taken to get there.
+        """
         path: list[PathItem] = []
         page_id = self.root_page_id
         page = self.buffer_pool.get(page_id)
@@ -199,6 +335,24 @@ class BPlusTree:
         path: list[PathItem],
         lsn: int,
     ) -> None:
+        """
+        Walk back up the recorded path, splitting or merging pages as needed.
+
+        Each affected page is marked dirty in the buffer pool; the actual writes happen later
+        on eviction or flush. A split or merge can ripple into the parent, which is why this
+        runs as a stack-based cascade rather than a single pass.
+
+        Parameters
+        ----------
+        modified_page_id
+            ID of the leaf (or internal) page that was just modified.
+        modified_page
+            The corresponding page object (already updated in memory).
+        path
+            The root-to-leaf path captured during the original descent.
+        lsn
+            LSN to stamp onto every page touched by the cascade.
+        """
         page_stack = [(modified_page_id, modified_page)]
         path_stack = path[:]
 
@@ -234,6 +388,25 @@ class BPlusTree:
         page: LeafPage | InternalPage,
         lsn: int,
     ) -> tuple[int, InternalPage]:
+        """
+        Split an overpopulated page into two and propagate the new separator to the parent.
+
+        Parameters
+        ----------
+        page_id
+            ID of the page being split.
+        parent_page_id
+            ID of the parent, or `None` if `page` is the current root.
+        page
+            The page being split (mutated in place to become the left half).
+        lsn
+            LSN to stamp onto the affected pages.
+
+        Returns
+        -------
+        The parent that needs to be revisited by the rebalancing cascade. When `page` was the
+        root, a fresh page is allocated to become the new root and is returned here.
+        """
         # Find a split point.
         slot_cumulative_sizes = []
         slot_size_sum = 0
@@ -305,7 +478,17 @@ class BPlusTree:
         distribution would leave one half below the underpopulated threshold, we scan outward
         for a split index that balances both halves.
 
-        Falls back to the byte midpoint when no balanced index exists.
+        Parameters
+        ----------
+        page
+            The page being split.
+        slot_cumulative_sizes
+            Running sum of slot sizes (including slot directory entries), indexed by slot.
+
+        Returns
+        -------
+        The slot index at which to split. Falls back to the byte midpoint when no balanced
+        index exists.
         """
         total_body = slot_cumulative_sizes[-1]
         byte_midpoint = bisect.bisect_right(slot_cumulative_sizes, total_body // 2)
@@ -329,6 +512,20 @@ class BPlusTree:
         page: LeafPage | InternalPage,
         split_slot_idx: int,
     ) -> bool:
+        """
+        Check whether a hypothetical split leaves both halves above the underpopulation threshold.
+
+        Parameters
+        ----------
+        page
+            The page that would be split.
+        split_slot_idx
+            The candidate split index.
+
+        Returns
+        -------
+        `True` if both halves end up healthy, `False` otherwise.
+        """
         match page:
             case LeafPage():
                 left = LeafPage(
@@ -364,6 +561,22 @@ class BPlusTree:
         tuple[int, None | LeafPage | InternalPage],
         tuple[int, None | LeafPage | InternalPage],
     ]:
+        """
+        Look up the left and right siblings of a child page, restricted to the same parent.
+
+        Parameters
+        ----------
+        parent_page
+            The parent of the page whose siblings we want.
+        parent_slot_idx
+            Slot index that points at the page under `parent_page`. Use `-1` for the leftmost
+            child.
+
+        Returns
+        -------
+        A `((left_id, left_page), (right_id, right_page))` tuple. Either side's page is `None`
+        when no sibling exists at that position under this parent.
+        """
         # Determine if the page has a left sibling and/or a right sibling within the same parent.
         left_sibling_id = -1
         right_sibling_id = -1
@@ -398,6 +611,27 @@ class BPlusTree:
         page: LeafPage | InternalPage,
         lsn: int,
     ) -> tuple[int, InternalPage] | None:
+        """
+        Rebalance an underpopulated page by redistributing slots with a sibling, or merging.
+
+        Parameters
+        ----------
+        page_id
+            ID of the underpopulated page.
+        parent_page_id
+            ID of the parent, or `None` if `page` is the root (in which case nothing is done).
+        parent_slot_idx
+            Slot index that points at `page` under its parent. Use `-1` for the leftmost child.
+        page
+            The underpopulated page itself.
+        lsn
+            LSN to stamp onto every page touched by the rebalance.
+
+        Returns
+        -------
+        The parent that still needs to be revisited by the cascade, or `None` if the rebalance
+        was self-contained (e.g. it ended in a root collapse).
+        """
         # Underpopulated root is allowed.
         if parent_page_id is None:
             return None
@@ -523,6 +757,25 @@ class BPlusTree:
         parent_page: InternalPage,
         parent_slot_idx: int,
     ) -> bool:
+        """
+        Move slots from `donor_page` into `recipient_page` until the recipient is healthy.
+
+        Parameters
+        ----------
+        donor_page
+            The sibling page that gives up slots.
+        recipient_page
+            The underpopulated page being rescued.
+        parent_page
+            The shared parent of both siblings.
+        parent_slot_idx
+            Slot index inside `parent_page` whose separator key gets rewritten during transfer.
+
+        Returns
+        -------
+        `True` on success. If the donor would itself fall below the threshold during the
+        transfer, the operation is rolled back and `False` is returned.
+        """
         donor_is_left = donor_page.slots[-1].key < recipient_page.slots[0].key
         parent_slot = parent_page.slots[parent_slot_idx]
 
