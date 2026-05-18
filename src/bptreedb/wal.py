@@ -282,9 +282,12 @@ class WAL:
                     new_wal_file.write(encode_wal_record(record))
             fsync_file(new_wal_file)
 
+        # Windows refuses to replace a file we hold open, so close first.
+        self._fd.close()
+        self._fd = None
+
         self.checkpoint_temp_path.replace(self.path)
         fsync_directory(self.path.parent)
 
-        self._fd.close()
         self._fd = open(self.path, "a+b")  # noqa: SIM115
         self.stats.truncations += 1

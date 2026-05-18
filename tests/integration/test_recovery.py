@@ -1,6 +1,17 @@
 from bptreedb.db import DB
 
 
+def simulate_crash(db: DB) -> None:
+    # Release the raw file handles without flushing, as the OS would on process death.
+    # Required on Windows, where leaked handles block the next DB reopen.
+    if db.wal._fd is not None:
+        db.wal._fd.close()
+        db.wal._fd = None
+    if db.pager._file is not None:
+        db.pager._file.close()
+        db.pager._file = None
+
+
 def test_reopen_after_clean_close_is_no_op(tmp_path):
     # GIVEN a DB closed cleanly after 5 puts (close runs a final checkpoint)
     with DB(tmp_path) as db:
@@ -22,6 +33,8 @@ def test_reopen_after_dirty_shutdown_replays_writes(tmp_path):
     for i in range(5):
         db.put(bytes([i]), b"v")
 
+    simulate_crash(db)
+
     # WHEN reopening
     with DB(tmp_path) as recovered:
         # THEN all 5 puts are recovered from the WAL tail
@@ -38,6 +51,8 @@ def test_reopen_after_checkpoint_then_dirty_writes(tmp_path):
     db.checkpoint()
     for i in range(5, 10):
         db.put(bytes([i]), b"second")
+
+    simulate_crash(db)
 
     # WHEN reopening
     with DB(tmp_path) as recovered:
@@ -56,6 +71,8 @@ def test_reopen_after_puts_and_deletes(tmp_path):
         db.put(bytes([i]), b"v")
     db.delete(bytes([1]))
     db.delete(bytes([3]))
+
+    simulate_crash(db)
 
     # WHEN reopening
     with DB(tmp_path) as recovered:

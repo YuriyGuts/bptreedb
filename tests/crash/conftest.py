@@ -105,6 +105,10 @@ class FaultyFile:
             rollback_handle.flush()
             os.fsync(rollback_handle.fileno())
 
+        # Close the wrapped handle so Windows lets the next test reopen / rename the path.
+        with contextlib.suppress(OSError, ValueError):
+            self._file.close()
+
 
 class FaultyFileFixture:
     """Tracks every `FaultyFile` opened during a test so they can be crashed
