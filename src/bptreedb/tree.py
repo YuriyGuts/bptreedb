@@ -132,7 +132,7 @@ class BPlusTree:
         DBRecordTooLargeError
             If the encoded `(key, value)` pair would exceed the per-page record size limit.
         """
-        self._raise_if_record_too_large(key, value)
+        self.raise_if_record_too_large(key, value)
 
         # Find a leaf page to insert into.
         leaf_result = self._find_leaf(key)
@@ -243,7 +243,7 @@ class BPlusTree:
             else:
                 return
 
-    def _raise_if_record_too_large(self, key: bytes, value: bytes) -> None:
+    def raise_if_record_too_large(self, key: bytes, value: bytes) -> None:
         """
         Bounds-check a key/value pair against the per-record size limit.
 

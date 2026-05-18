@@ -203,6 +203,7 @@ class DB:
         self._check_if_opened()
         self._ensure_bytes_type(key, "key")
         self._ensure_bytes_type(value, "value")
+        self.tree.raise_if_record_too_large(key, value)
 
         # Make sure the buffer pool has room for the pages that may be touched by tree rebalancing.
         # `tree.insert` is not transactional, so a pool overflow during rebalance would leave the

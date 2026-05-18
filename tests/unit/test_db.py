@@ -6,6 +6,7 @@ import pytest
 from bptreedb.db import DB
 from bptreedb.exceptions import DBClosedError
 from bptreedb.exceptions import DBConcurrentPageModificationError
+from bptreedb.exceptions import DBRecordTooLargeError
 
 
 @pytest.fixture
@@ -261,3 +262,27 @@ def test_all_keys_and_values_must_be_bytes(db):
         db.scan("foo", None)
     with pytest.raises(TypeError, match=msg):
         db.scan(None, "foo")
+
+
+def test_oversized_put_does_not_poison_recovery(tmp_path):
+    # GIVEN an open DB with a small page size
+    db = DB(tmp_path, page_size_bytes=256)
+    db.open()
+
+    # WHEN attempting to write an oversized record
+    # THEN the write is rejected before it reaches the WAL
+    with pytest.raises(DBRecordTooLargeError):
+        db.put(b"k", b"x" * 1000)
+
+    # WHEN the process dies without `DB.close()` running a final checkpoint
+    if db.wal._fd is not None:
+        db.wal._fd.close()
+        db.wal._fd = None
+    if db.pager._file is not None:
+        db.pager._file.close()
+        db.pager._file = None
+    db.is_opened = False
+
+    # THEN reopening succeeds and the rejected record is absent
+    with DB(tmp_path, page_size_bytes=256) as recovered:
+        assert list(recovered.scan(None, None)) == []
