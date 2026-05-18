@@ -216,6 +216,7 @@ def test_free_overflows_into_new_head(path):
             pager.free_page(page_id)
 
         new_head_id = pager.get_meta().freelist_head_page_id
+        pager.flush_dirty_freelist_pages()
         new_head = decode_page(pager.read_page(new_head_id))
         old_head = decode_page(pager.read_page(new_head.next_freelist_page_id))
 

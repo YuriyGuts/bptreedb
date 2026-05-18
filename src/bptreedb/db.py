@@ -313,6 +313,7 @@ class DB:
         """
         checkpoint_lsn = self.wal.current_lsn + 1
         self.buffer_pool.flush_all()
+        self.pager.flush_dirty_freelist_pages()
         self.pager.fsync()
         meta = self.pager.get_meta()
         self.wal.append_checkpoint(

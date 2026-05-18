@@ -1,4 +1,5 @@
 from bptreedb.db import DB
+from bptreedb.debug import assert_tree_invariants
 
 
 def simulate_crash(db: DB) -> None:
@@ -79,3 +80,41 @@ def test_reopen_after_puts_and_deletes(tmp_path):
         # THEN only the surviving keys are present
         keys = [k for k, _ in recovered.scan(None, None)]
         assert keys == [bytes([0]), bytes([2]), bytes([4])]
+
+
+def test_recovery_does_not_double_free_pages_from_uncheckpointed_deletes(tmp_path):
+    # GIVEN a DB with a populated freelist from checkpointed deletes
+    db = DB(
+        tmp_path,
+        page_size_bytes=256,
+        checkpoint_wal_size_bytes=1024 * 1024 * 1024,
+        checkpoint_dirty_page_ratio=10,
+    )
+    db.open()
+
+    for i in range(80):
+        db.put(f"k{i:03d}".encode(), b"v" * 10)
+    for i in range(40):
+        assert db.delete(f"k{i:03d}".encode()) is True
+    db.checkpoint()
+
+    # WHEN more deletes free pages after the checkpoint and the process dies
+    for i in range(40, 60):
+        assert db.delete(f"k{i:03d}".encode()) is True
+
+    simulate_crash(db)
+
+    # THEN recovery replays the deletes without double-freeing their pages
+    with DB(
+        tmp_path,
+        page_size_bytes=256,
+        checkpoint_wal_size_bytes=1024 * 1024 * 1024,
+        checkpoint_dirty_page_ratio=10,
+    ) as recovered:
+        expected = [(f"k{i:03d}".encode(), b"v" * 10) for i in range(60, 80)]
+        assert list(recovered.scan(None, None)) == expected
+
+        # THEN later inserts can safely reuse freed pages while preserving tree invariants
+        for i in range(100, 180):
+            recovered.put(f"n{i:03d}".encode(), b"x" * 10)
+            assert_tree_invariants(recovered.tree)
