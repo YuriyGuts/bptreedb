@@ -9,7 +9,6 @@ on reopen.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -20,6 +19,7 @@ from hypothesis import strategies as st
 
 from bptreedb.db import DB
 from bptreedb.db import WAL_FILENAME
+from bptreedb.fs import _fsync_fd
 from tests.crash.conftest import FaultyFile
 from tests.crash.conftest import FaultyFileFixture
 
@@ -136,7 +136,7 @@ def test_acknowledged_writes_survive_crash(
     # would have its file handles forcibly closed by the OS, not gracefully
     # flushed by application code.
 
-    # WHEN we re-open the DB with the *real* `open` and `os.fsync`
+    # WHEN we re-open the DB with the *real* `open` and `_fsync_fd`
     # (the monkeypatch is undone below by reusing a fresh fixture per example)
     monkeypatch.undo()
     with DB(tmp_path) as recovered:
@@ -151,7 +151,7 @@ def _install_fault_injection(monkeypatch: pytest.MonkeyPatch) -> FaultyFileFixtu
     test that's already inside `@given` (where the fixture's once-per-function
     lifetime would otherwise leak state across Hypothesis examples)."""
     fixture = FaultyFileFixture()
-    real_fsync = os.fsync
+    real_fsync_fd = _fsync_fd
 
     def faulty_open(path, mode, *args, **kwargs):
         # See `tests/crash/conftest.py` for why read-only opens bypass the
@@ -163,14 +163,12 @@ def _install_fault_injection(monkeypatch: pytest.MonkeyPatch) -> FaultyFileFixtu
         fixture.register(faulty_file)
         return faulty_file
 
-    def patched_fsync(fd):
+    def patched_fsync_fd(fd):
         if isinstance(fd, FaultyFile):
             fd.record_fsync()
-            real_fsync(fd.fileno())
-        else:
-            real_fsync(fd)
+        real_fsync_fd(fd)
 
     monkeypatch.setattr("bptreedb.wal.open", faulty_open, raising=False)
     monkeypatch.setattr("bptreedb.pager.open", faulty_open, raising=False)
-    monkeypatch.setattr(os, "fsync", patched_fsync)
+    monkeypatch.setattr("bptreedb.fs._fsync_fd", patched_fsync_fd)
     return fixture

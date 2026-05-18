@@ -2,7 +2,7 @@
 Crash-test infrastructure.
 
 Contains a fault-injecting file wrapper plus a pytest fixture that monkeypatches
-the WAL's `open` and the global `os.fsync` so that DB writes can be "rolled back"
+the WAL's `open` and `bptreedb.fs._fsync_fd` so that DB writes can be "rolled back"
 mid-test to simulate a power failure.
 
 The simulation model:
@@ -23,6 +23,8 @@ from typing import IO
 from typing import Self
 
 import pytest
+
+from bptreedb.fs import _fsync_fd
 
 
 class FaultyFile:
@@ -86,7 +88,7 @@ class FaultyFile:
     def record_fsync(self) -> None:
         """Snapshot the file's current on-disk contents as the durable state.
 
-        Called by the patched `os.fsync` whenever the WAL syncs this file.
+        Called by the patched `_fsync_fd` whenever the WAL syncs this file.
         """
         self._fsynced_snapshot = self._read_disk_contents()
 
@@ -121,7 +123,7 @@ class FaultyFileFixture:
 
 @pytest.fixture
 def faulty_files(monkeypatch: pytest.MonkeyPatch) -> FaultyFileFixture:
-    """Patch the WAL's and pager's `open`, plus the global `os.fsync`, so every DB file is
+    """Patch the WAL's and pager's `open`, plus `bptreedb.fs._fsync_fd`, so every DB file is
     a `FaultyFile` and every fsync snapshots the file's durable state.
 
     Wrapping the pager too (not just the WAL) lets crash tests model lost data-file writes.
@@ -130,7 +132,7 @@ def faulty_files(monkeypatch: pytest.MonkeyPatch) -> FaultyFileFixture:
     failure by rolling every tracked file back to its last fsynced contents.
     """
     fixture = FaultyFileFixture()
-    real_fsync = os.fsync
+    real_fsync_fd = _fsync_fd
 
     def faulty_open(path: str | Path, mode: str, *args: object, **kwargs: object):  # noqa: ANN202
         # Read-only opens don't need crash semantics: reads can't be lost on a
@@ -145,12 +147,10 @@ def faulty_files(monkeypatch: pytest.MonkeyPatch) -> FaultyFileFixture:
         fixture.register(faulty_file)
         return faulty_file
 
-    def patched_fsync(fd: int | FaultyFile | IO[bytes]) -> None:
+    def patched_fsync_fd(fd: int | FaultyFile | IO[bytes]) -> None:
         if isinstance(fd, FaultyFile):
             fd.record_fsync()
-            real_fsync(fd.fileno())
-        else:
-            real_fsync(fd)
+        real_fsync_fd(fd)
 
     # `bptreedb.wal.open` and `bptreedb.pager.open` resolve to `builtins.open` because
     # neither module rebinds it. Setting an attribute on the module makes the lookup find
@@ -158,8 +158,7 @@ def faulty_files(monkeypatch: pytest.MonkeyPatch) -> FaultyFileFixture:
     monkeypatch.setattr("bptreedb.wal.open", faulty_open, raising=False)
     monkeypatch.setattr("bptreedb.pager.open", faulty_open, raising=False)
 
-    # Patch `os.fsync` globally for the duration of the test. Both the WAL and the pager
-    # route their fsyncs through `fs.fsync_file`, which calls `os.fsync` directly.
-    monkeypatch.setattr(os, "fsync", patched_fsync)
+    # Patch the fsync function globally for the duration of the test.
+    monkeypatch.setattr("bptreedb.fs._fsync_fd", patched_fsync_fd)
 
     return fixture
