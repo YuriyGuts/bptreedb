@@ -28,22 +28,32 @@ and used the AI as a reviewer and rubber duck along the way.
 - Crash recovery: replays the WAL from the last checkpoint on open.
 - Configurable page size (default 4 KiB). Slotted pages with variable-length records.
 - Page reuse via a singly-linked freelist.
-- Tested with Hypothesis-driven property tests and crash tests introducing random I/O errors.
+- SQL query layer on top of the KV core, parsed via `sqlglot`: `CREATE/DROP TABLE`,
+  `INSERT/UPDATE/DELETE`, `SELECT` with `WHERE`/`ORDER BY`/`LIMIT`/`GROUP BY`/`HAVING`,
+  aggregates (`COUNT/SUM/MIN/MAX/AVG`), `INNER JOIN`, and subqueries in `FROM`.
+- Tested with Hypothesis-driven property tests (including SQLite-equivalence tests for
+  the SQL layer) and crash tests introducing random I/O errors.
 
 ## Out of Scope
 
 Some features often found in production-grade databases were deliberately left out of scope
 for simplicity and code readability. See [the production readiness gap analysis](docs/bptreedb-production-readiness-gap-analysis.md) document for details.
 
-- **No transactions.** Each `put` and `delete` is its own atomic, durable unit.
+- **No transactions.** Each `put` and `delete` is its own atomic, durable unit. The SQL
+  layer inherits this: a single SQL statement that performs N writes is not atomic
+  across all N — a crash mid-statement leaves a prefix of writes (in PK order) durable
+  and the rest gone. There is no `BEGIN`/`COMMIT`/`ROLLBACK`.
 - **No concurrency.** One thread, one writer, one reader, everything serialized.
-- **No SQL, schemas, or secondary indexes.** Just an ordered key-value API. Real SQL engines like CockroachDB or TiDB put a relational layer on top of exactly this kind of KV backend.
+- **No secondary indexes.** Every SQL `WHERE` clause does a full table scan; planning
+  is therefore O(table-size). The KV API is a single ordered keyspace.
 - **Max record size: ~20% of the page size.** Oversized values are rejected outright.
 - **Single meta page, no ping-pong.** If the meta page suffers a torn write, it is unrecoverable.
 - **Logical WAL only.** Records describe `PUT(k, v)` / `DELETE(k)`, not byte-level page deltas. This is sound only because we're single-threaded and NO-STEAL.
 - **No compression, encryption, replication, or networking.** Out of scope by a wide margin.
 
 ## Code Usage
+
+Raw key/value API:
 
 ```python
 from bptreedb import DB
@@ -53,6 +63,18 @@ with DB("path/to/dir") as db:
     print(db.get(b"hello"))
     for k, v in db.scan(start_key_inclusive=b"a", end_key_exclusive=b"z"):
         ...
+```
+
+SQL API:
+
+```python
+from bptreedb import DB
+
+with DB("path/to/dir") as db:
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+    db.execute("INSERT INTO users VALUES (1, 'alice', 30), (2, 'bob', 25)")
+    for (name,) in db.execute("SELECT name FROM users WHERE age > 26 ORDER BY name"):
+        print(name)
 ```
 
 ## Development

@@ -16,6 +16,9 @@ from bptreedb.exceptions import DBClosedError
 from bptreedb.exceptions import DBConcurrentPageModificationError
 from bptreedb.fs import fsync_directory
 from bptreedb.pager import Pager
+from bptreedb.sql.catalog import Catalog
+from bptreedb.sql.executor import Cursor
+from bptreedb.sql.planner import Planner
 from bptreedb.tree import BPlusTree
 from bptreedb.wal import WAL
 
@@ -303,6 +306,40 @@ class DB:
                 raise DBConcurrentPageModificationError()
 
         return self.tree.scan(start_key_inclusive, end_key_exclusive, check_version)
+
+    def execute(self, sql: str, parameters: tuple = ()) -> Cursor:
+        """
+        Run a single SQL statement and return a `Cursor` over the result.
+
+        Supported statements: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`,
+        and `SELECT` with `WHERE`, `ORDER BY`, `LIMIT/OFFSET`, `GROUP BY`, `HAVING`,
+        aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`), `INNER JOIN`, and subqueries
+        in `FROM`.
+
+        Atomicity note: a SQL statement that performs N writes is NOT atomic across all
+        N writes. The underlying KV layer guarantees that each individual write is durable,
+        so a crash mid-statement leaves a prefix of writes (in primary-key order) durable
+        and the rest gone. DDL (`CREATE TABLE`/`DROP TABLE`'s metadata writes) is a single
+        KV write and therefore atomic; row deletion in `DROP TABLE` is not.
+
+        Parameters
+        ----------
+        sql
+            A single SQL statement.
+        parameters
+            Values bound to `?` placeholders, in order.
+
+        Returns
+        -------
+        A `Cursor` over the result rows. DML/DDL cursors yield no rows but expose
+        `rowcount` (rows mutated, or 0 for DDL).
+        """
+        self._check_if_opened()
+        catalog = Catalog(self)
+        catalog.ensure_initialized()
+        planner = Planner(catalog, self)
+        plan = planner.plan(sql, tuple(parameters))
+        return Cursor(plan)
 
     def checkpoint(self) -> None:
         """
